@@ -31,6 +31,8 @@ Environment variables:
 | `OLLAMA_URL` | `http://localhost:11434` | Base URL of the Ollama server |
 | `OLLAMA_EMBED_MODEL` | `all-minilm` | Ollama embedding model name |
 | `PORT` | `8080` | HTTP listen port |
+| `AUTH_TOKEN` | *(none)* | Bearer token(s) required on `/mcp` (comma-separated for multiple clients). If unset, auth is disabled — set this in production. |
+| `ALLOWED_HOSTS` | *(none)* | Comma-separated `Host` header allowlist, guards against DNS-rebinding. If unset, the check is skipped — set this in production. |
 
 ## Run locally
 
@@ -75,6 +77,10 @@ servers (e.g. Claude Desktop), bridge through
 ```
 
 (`--allow-http` is only needed for a plain-HTTP, non-localhost URL.)
+
+If `AUTH_TOKEN` is set on the server, add a `--header "Authorization: Bearer
+<token>"` arg to `mcp-remote` (or the equivalent header config for clients
+that talk Streamable HTTP directly).
 
 ## Known limitation
 

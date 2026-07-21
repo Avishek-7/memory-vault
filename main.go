@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -178,6 +179,13 @@ func errResult(s string) map[string]interface{} {
 	return map[string]interface{}{"content": []map[string]string{{"type": "text", "text": s}}, "isError": true}
 }
 
+// internalErr logs the real error server-side and returns a generic message
+// to the client, so DB/network internals never leak over the wire.
+func internalErr(context string, err error) map[string]interface{} {
+	log.Printf("%s: %v", context, err)
+	return errResult("internal error")
+}
+
 func callTool(name string, args map[string]interface{}) map[string]interface{} {
 	switch name {
 	case "save_memory":
@@ -188,7 +196,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		}
 		vec, err := embed(content)
 		if err != nil {
-			return errResult(err.Error())
+			return internalErr("save_memory embed", err)
 		}
 		_, err = db.Exec(`
 			INSERT INTO memories (name, content, embedding, updated_at)
@@ -196,7 +204,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			ON CONFLICT (name) DO UPDATE SET content = $2, embedding = $3::vector, updated_at = now()
 		`, n, content, vectorLiteral(vec))
 		if err != nil {
-			return errResult(err.Error())
+			return internalErr("save_memory insert", err)
 		}
 		return textResult(fmt.Sprintf("saved memory %q (%d bytes)", n, len(content)))
 
@@ -207,21 +215,21 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		if err == sql.ErrNoRows {
 			return errResult(fmt.Sprintf("memory %q not found", n))
 		} else if err != nil {
-			return errResult(err.Error())
+			return internalErr("get_memory query", err)
 		}
 		return textResult(content)
 
 	case "list_memories":
 		rows, err := db.Query(`SELECT name FROM memories ORDER BY name`)
 		if err != nil {
-			return errResult(err.Error())
+			return internalErr("list_memories query", err)
 		}
 		defer rows.Close()
 		var names []string
 		for rows.Next() {
 			var n string
 			if err := rows.Scan(&n); err != nil {
-				return errResult(err.Error())
+				return internalErr("list_memories scan", err)
 			}
 			names = append(names, n)
 		}
@@ -237,7 +245,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		}
 		vec, err := embed(q)
 		if err != nil {
-			return errResult(err.Error())
+			return internalErr("search_memories embed", err)
 		}
 		rows, err := db.Query(`
 			SELECT name, content, embedding <=> $1::vector AS distance
@@ -246,7 +254,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			LIMIT 5
 		`, vectorLiteral(vec))
 		if err != nil {
-			return errResult(err.Error())
+			return internalErr("search_memories query", err)
 		}
 		defer rows.Close()
 		var out []string
@@ -254,7 +262,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			var n, content string
 			var dist float64
 			if err := rows.Scan(&n, &content, &dist); err != nil {
-				return errResult(err.Error())
+				return internalErr("search_memories scan", err)
 			}
 			out = append(out, fmt.Sprintf("%s (distance %.4f): %s", n, dist, content))
 		}
@@ -267,7 +275,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		n, _ := args["name"].(string)
 		res, err := db.Exec(`DELETE FROM memories WHERE name = $1`, n)
 		if err != nil {
-			return errResult(err.Error())
+			return internalErr("delete_memory exec", err)
 		}
 		if affected, _ := res.RowsAffected(); affected == 0 {
 			return errResult(fmt.Sprintf("memory %q not found", n))
@@ -323,7 +331,68 @@ func newSessionID() string {
 	return hex.EncodeToString(b)
 }
 
+// authTokens returns the set of accepted bearer tokens from AUTH_TOKEN
+// (comma-separated for multiple clients). Empty means auth is disabled.
+func authTokens() []string {
+	raw := os.Getenv("AUTH_TOKEN")
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, ",")
+}
+
+func checkAuth(r *http.Request) bool {
+	tokens := authTokens()
+	if len(tokens) == 0 {
+		return true // no AUTH_TOKEN configured: auth disabled
+	}
+	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if got == "" {
+		return false
+	}
+	for _, t := range tokens {
+		if subtle.ConstantTimeCompare([]byte(got), []byte(t)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// allowedHosts returns the Host header allowlist from ALLOWED_HOSTS
+// (comma-separated). Empty means the check is skipped (not recommended).
+func allowedHosts() []string {
+	raw := os.Getenv("ALLOWED_HOSTS")
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, ",")
+}
+
+// checkHost guards against DNS-rebinding attacks by rejecting requests
+// whose Host header isn't in the configured allowlist.
+func checkHost(r *http.Request) bool {
+	hosts := allowedHosts()
+	if len(hosts) == 0 {
+		return true
+	}
+	for _, h := range hosts {
+		if r.Host == h {
+			return true
+		}
+	}
+	return false
+}
+
 func mcpHandler(w http.ResponseWriter, r *http.Request) {
+	if !checkHost(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if !checkAuth(r) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="memory-vault"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	if r.Method == http.MethodDelete {
 		w.WriteHeader(http.StatusNoContent)
 		return
