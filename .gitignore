@@ -1,0 +1,14 @@
+# Compiled binary
+/memory-vault
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# Env files (never commit secrets/credentials)
+.env
+*.env
+
+# OS files
+.DS_Store
