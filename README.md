@@ -82,6 +82,22 @@ If `AUTH_TOKEN` is set on the server, add a `--header "Authorization: Bearer
 <token>"` arg to `mcp-remote` (or the equivalent header config for clients
 that talk Streamable HTTP directly).
 
+## CI/CD
+
+On every push to `master`, GitHub Actions (`.github/workflows/ci.yml`) runs
+`go vet` + `go test` + a build, and if that passes, builds and pushes a
+Docker image to `ghcr.io/avishek-7/memory-vault` tagged `latest` and with
+the commit SHA. It does not deploy — pull and restart on the server
+yourself when ready:
+
+```
+docker pull ghcr.io/avishek-7/memory-vault:latest
+cd /home/avishek/Docker && docker compose up -d memory-vault
+```
+
+(`develop` is where in-progress work lands; merge to `master` once stable
+to trigger the pipeline.)
+
 ## Known limitation
 
 `all-minilm` has a 256-token context window. Content longer than that
