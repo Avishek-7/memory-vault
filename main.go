@@ -479,6 +479,58 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 	}
 }
 
+type resource struct {
+	URI      string `json:"uri"`
+	Name     string `json:"name"`
+	MimeType string `json:"mimeType"`
+}
+
+func resourceURI(space, name string) string {
+	return fmt.Sprintf("memory://%s/%s", space, name)
+}
+
+// errNotFound marks a not-found condition distinct from internal errors,
+// so the caller can pick the right JSON-RPC error code.
+var errNotFound = fmt.Errorf("not found")
+
+func listResources() (interface{}, error) {
+	rows, err := db.Query(`SELECT DISTINCT space, name FROM memories ORDER BY space, name`)
+	if err != nil {
+		log.Printf("resources/list query: %v", err)
+		return nil, fmt.Errorf("internal error")
+	}
+	defer rows.Close()
+	res := []resource{}
+	for rows.Next() {
+		var s, n string
+		if err := rows.Scan(&s, &n); err != nil {
+			log.Printf("resources/list scan: %v", err)
+			return nil, fmt.Errorf("internal error")
+		}
+		res = append(res, resource{URI: resourceURI(s, n), Name: fmt.Sprintf("%s/%s", s, n), MimeType: "text/plain"})
+	}
+	return map[string]interface{}{"resources": res}, nil
+}
+
+func readResource(uri string) (interface{}, error) {
+	rest := strings.TrimPrefix(uri, "memory://")
+	space, name, ok := strings.Cut(rest, "/")
+	if !ok || space == "" || name == "" {
+		return nil, fmt.Errorf("invalid resource uri %q", uri)
+	}
+	content, err := reassemble(space, name)
+	if err != nil {
+		log.Printf("resources/read query: %v", err)
+		return nil, fmt.Errorf("internal error")
+	}
+	if content == "" {
+		return nil, errNotFound
+	}
+	return map[string]interface{}{
+		"contents": []map[string]string{{"uri": uri, "mimeType": "text/plain", "text": content}},
+	}, nil
+}
+
 // handle processes one JSON-RPC message and returns the reply to send,
 // or nil for notifications (which get no body, just a 202).
 func handle(req request) *response {
@@ -486,8 +538,11 @@ func handle(req request) *response {
 	case "initialize":
 		return resultMsg(req.ID, map[string]interface{}{
 			"protocolVersion": "2024-11-05",
-			"capabilities":    map[string]interface{}{"tools": map[string]interface{}{}},
-			"serverInfo":      map[string]string{"name": "memory-vault", "version": "0.4.0"},
+			"capabilities": map[string]interface{}{
+				"tools":     map[string]interface{}{},
+				"resources": map[string]interface{}{},
+			},
+			"serverInfo": map[string]string{"name": "memory-vault", "version": "0.5.0"},
 		})
 
 	case "notifications/initialized":
@@ -505,6 +560,29 @@ func handle(req request) *response {
 			return errorMsg(req.ID, -32602, "invalid params")
 		}
 		return resultMsg(req.ID, callTool(params.Name, params.Arguments))
+
+	case "resources/list":
+		result, err := listResources()
+		if err != nil {
+			return errorMsg(req.ID, -32000, err.Error())
+		}
+		return resultMsg(req.ID, result)
+
+	case "resources/read":
+		var params struct {
+			URI string `json:"uri"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return errorMsg(req.ID, -32602, "invalid params")
+		}
+		result, err := readResource(params.URI)
+		if err != nil {
+			if err == errNotFound {
+				return errorMsg(req.ID, -32001, fmt.Sprintf("resource %q not found", params.URI))
+			}
+			return errorMsg(req.ID, -32000, err.Error())
+		}
+		return resultMsg(req.ID, result)
 
 	case "ping":
 		return resultMsg(req.ID, map[string]interface{}{})

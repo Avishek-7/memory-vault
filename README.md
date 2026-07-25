@@ -20,6 +20,12 @@ namespace memories — the same `name` can exist independently in different
 spaces. `list_memories` without a `space` lists everything grouped by
 space; with one, it lists just that space's memory names.
 
+## Resources
+
+Every stored memory is also browsable as an MCP resource
+(`resources/list`, `resources/read`), addressed by URI
+`memory://<space>/<name>`, alongside the `tools/call` interface above.
+
 ## Requirements
 
 - Postgres with the `vector` extension available (e.g. `pgvector/pgvector:pg16`)
