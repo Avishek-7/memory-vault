@@ -44,8 +44,13 @@ services:
   memory-vault:
     build: .
     restart: unless-stopped
+    # Bound to loopback only: AUTH_TOKEN is unset by default in this
+    # quickstart, so publishing to all interfaces would mean an
+    # unauthenticated MCP server reachable from the network (or the
+    # internet, on a cloud host). Change to "8080:8080" if you need
+    # non-local access, and set AUTH_TOKEN/ALLOWED_HOSTS in .env first.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     # AUTH_TOKEN, ALLOWED_HOSTS, and the Ollama model names come from
     # .env (copy .env.example to get started). DATABASE_URL/OLLAMA_URL
     # below always point at the other compose services and override
