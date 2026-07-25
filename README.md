@@ -41,6 +41,36 @@ manual/on-demand — there's no background cron. If you want it to run
 automatically, wire a periodic call to the tool into a cron job or an
 n8n/similar workflow.
 
+## Browsing memories
+
+`memory-vault-tui` is a standalone terminal browser that talks to Postgres
+directly (via `internal/store`, the same code the MCP server uses) — no
+MCP client or LLM chat loop needed to look through, edit, or clean up
+memories.
+
+```
+go build -o memory-vault-tui ./cmd/memory-vault-tui
+DATABASE_URL="postgres://user:pass@localhost:5432/memory_vault?sslmode=disable" \
+OLLAMA_URL="http://localhost:11434" \
+./memory-vault-tui
+```
+
+(or `go run ./cmd/memory-vault-tui` without building a binary first.)
+
+| Key | Action |
+|---|---|
+| `↑`/`k`, `↓`/`j` | Move selection |
+| `/` | Semantic search within the current space |
+| `e` | Edit the selected memory in `$EDITOR` (falls back to `nvim`); saves and re-embeds on exit |
+| `n` | Create a new memory: prompts for name and space, then opens `$EDITOR` for content |
+| `d` | Delete the selected memory (confirm with `y`) |
+| `esc` | Back out of search results / a prompt |
+| `q` | Quit |
+
+It's a separate binary meant to run on the host or server with an
+interactive terminal — it is not built into the Docker image the MCP
+server ships in.
+
 ## Resources
 
 Every stored memory is also browsable as an MCP resource

@@ -1,0 +1,46 @@
+package main
+
+import (
+	"testing"
+
+	"memory-vault/internal/store"
+)
+
+func TestRowsFromAll(t *testing.T) {
+	rows := rowsFromAll([]store.SpaceName{
+		{Space: "default", Name: "a"},
+		{Space: "default", Name: "b"},
+		{Space: "work", Name: "c"},
+	})
+	want := []struct {
+		isHeader bool
+		label    string
+	}{
+		{true, "default"},
+		{false, "a"},
+		{false, "b"},
+		{true, "work"},
+		{false, "c"},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rowsFromAll: got %d rows, want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		if rows[i].isHeader != w.isHeader || rows[i].label != w.label {
+			t.Errorf("rows[%d] = %+v, want isHeader=%v label=%q", i, rows[i], w.isHeader, w.label)
+		}
+	}
+}
+
+func TestMoveCursorSkipsHeaders(t *testing.T) {
+	m := model{rows: rowsFromAll([]store.SpaceName{
+		{Space: "default", Name: "a"},
+		{Space: "work", Name: "b"},
+	})}
+	// rows: [header default, a, header work, b]
+	m.cursor = 1 // "a"
+	m.moveCursor(1)
+	if m.cursor != 3 || m.rows[m.cursor].name != "b" {
+		t.Errorf("moveCursor(1) landed on row %d (%+v), want row 3 (b)", m.cursor, m.rows[m.cursor])
+	}
+}
