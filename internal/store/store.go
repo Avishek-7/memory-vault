@@ -6,6 +6,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -13,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 
 	"memory-vault/internal/embed"
 )
@@ -250,33 +251,64 @@ func (s *Store) Reassemble(space, name string) (string, error) {
 // SaveMemory chunks, embeds, and (re)writes content under (space, name),
 // replacing any existing chunks for that name. Returns the chunk count.
 func (s *Store) SaveMemory(space, name, content string) (int, error) {
-	chunks := ChunkContent(content)
-	tx, err := s.DB.Begin()
+	wrote, chunks, err := s.saveMemory(space, name, content, true)
 	if err != nil {
 		return 0, err
 	}
-	if _, err := tx.Exec(`DELETE FROM memories WHERE space = $1 AND name = $2`, space, name); err != nil {
-		tx.Rollback()
-		return 0, err
+	_ = wrote // always true when overwrite is true
+	return chunks, nil
+}
+
+// isUniqueViolation reports whether err is a Postgres unique-constraint
+// violation (SQLSTATE 23505) — here, a concurrent write to the same
+// (space, name, chunk_index) primary key.
+func isUniqueViolation(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == "23505"
+}
+
+// saveMemory chunks, embeds, and writes content under (space, name) in a
+// single transaction. If overwrite is true, any existing chunks for that
+// name are deleted first (SaveMemory's behavior, unconditional replace).
+// If overwrite is false, existing rows are left alone: the insert's own
+// primary-key uniqueness is what enforces "don't clobber" atomically
+// (rather than a separate existence check before the write, which a
+// concurrent writer could race between) — a conflict there, whether from
+// a memory that already existed before this call or one written by a
+// concurrent caller mid-transaction, means wrote=false with no error.
+func (s *Store) saveMemory(space, name, content string, overwrite bool) (wrote bool, chunks int, err error) {
+	chunkList := ChunkContent(content)
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return false, 0, err
 	}
-	for i, chunk := range chunks {
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+
+	if overwrite {
+		if _, err := tx.Exec(`DELETE FROM memories WHERE space = $1 AND name = $2`, space, name); err != nil {
+			return false, 0, err
+		}
+	}
+	for i, chunk := range chunkList {
 		vec, err := s.Embed(chunk)
 		if err != nil {
-			tx.Rollback()
-			return 0, err
+			return false, 0, err
 		}
-		if _, err := tx.Exec(`
+		_, err = tx.Exec(`
 			INSERT INTO memories (space, name, chunk_index, content, embedding, updated_at)
 			VALUES ($1, $2, $3, $4, $5::vector, now())
-		`, space, name, i, chunk, VectorLiteral(vec)); err != nil {
-			tx.Rollback()
-			return 0, err
+		`, space, name, i, chunk, VectorLiteral(vec))
+		if err != nil {
+			if !overwrite && isUniqueViolation(err) {
+				return false, 0, nil
+			}
+			return false, 0, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, err
+		return false, 0, err
 	}
-	return len(chunks), nil
+	return true, len(chunkList), nil
 }
 
 // DeleteMemory deletes a memory by (space, name); the bool reports whether
@@ -529,20 +561,15 @@ func (s *Store) Import(data []MemoryExport, spaceOverride string, overwrite bool
 		if space == "" {
 			space = DefaultSpace
 		}
-		if !overwrite {
-			existing, err := s.Reassemble(space, m.Name)
-			if err != nil {
-				return res, err
-			}
-			if existing != "" {
-				res.Skipped = append(res.Skipped, space+"/"+m.Name)
-				continue
-			}
-		}
-		if _, err := s.SaveMemory(space, m.Name, m.Content); err != nil {
+		wrote, _, err := s.saveMemory(space, m.Name, m.Content, overwrite)
+		if err != nil {
 			return res, err
 		}
-		res.Imported = append(res.Imported, space+"/"+m.Name)
+		if wrote {
+			res.Imported = append(res.Imported, space+"/"+m.Name)
+		} else {
+			res.Skipped = append(res.Skipped, space+"/"+m.Name)
+		}
 	}
 	return res, nil
 }
