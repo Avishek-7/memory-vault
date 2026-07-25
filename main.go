@@ -58,8 +58,17 @@ func envOrFloat(key string, fallback float64) float64 {
 	return fallback
 }
 
-func ollamaURL() string   { return envOr("OLLAMA_URL", "http://localhost:11434") }
-func ollamaModel() string { return envOr("OLLAMA_EMBED_MODEL", "all-minilm") }
+func ollamaURL() string       { return envOr("OLLAMA_URL", "http://localhost:11434") }
+func ollamaModel() string     { return envOr("OLLAMA_EMBED_MODEL", "all-minilm") }
+func ollamaChatModel() string { return envOr("OLLAMA_CHAT_MODEL", "llama3.1:8b") }
+
+// compactionSettings returns the cosine-distance threshold under which two
+// memories' centroid embeddings are considered near-duplicates, and the
+// staleness window (in days) past which a lone memory is still a compaction
+// candidate (for re-summarization) even without a similar sibling.
+func compactionSettings() (similarityThreshold float64, staleDays int) {
+	return envOrFloat("COMPACT_SIMILARITY_THRESHOLD", 0.15), envOrInt("COMPACT_STALE_DAYS", 90)
+}
 
 func initDB() error {
 	dsn := os.Getenv("DATABASE_URL")
@@ -185,6 +194,66 @@ func vectorLiteral(v []float32) string {
 	return "[" + strings.Join(parts, ",") + "]"
 }
 
+// parseVectorLiteral parses pgvector's text output format ("[0.1,0.2,0.3]")
+// back into a float64 slice.
+func parseVectorLiteral(s string) ([]float64, error) {
+	s = strings.Trim(s, "[]")
+	if s == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]float64, len(parts))
+	for i, p := range parts {
+		f, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = f
+	}
+	return out, nil
+}
+
+// cosineDistance mirrors pgvector's <=> operator (1 - cosine similarity).
+func cosineDistance(a, b []float64) float64 {
+	var dot, na, nb float64
+	for i := range a {
+		dot += a[i] * b[i]
+		na += a[i] * a[i]
+		nb += b[i] * b[i]
+	}
+	if na == 0 || nb == 0 {
+		return 1
+	}
+	return 1 - dot/(math.Sqrt(na)*math.Sqrt(nb))
+}
+
+// ollamaChat sends a single-turn prompt to the local Ollama chat model and
+// returns its response text. Used only by compact_memories, never search/save.
+func ollamaChat(prompt string) (string, error) {
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"model":    ollamaChatModel(),
+		"messages": []map[string]string{{"role": "user", "content": prompt}},
+		"stream":   false,
+	})
+	resp, err := http.Post(ollamaURL()+"/api/chat", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("ollama chat request failed (is Ollama running with %q pulled?): %w", ollamaChatModel(), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ollama chat returned status %d", resp.StatusCode)
+	}
+	var out struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	return out.Message.Content, nil
+}
+
 // --- JSON-RPC plumbing ---
 
 type request struct {
@@ -248,6 +317,11 @@ var tools = []tool{
 		Description: "Delete a memory by name, optionally scoped to a space (default: \"default\").",
 		InputSchema: schema([]string{"name"}, map[string]string{"name": "string", "space": "string"}),
 	},
+	{
+		Name:        "compact_memories",
+		Description: "Find near-duplicate or stale memories (within a space, or all spaces if omitted) and merge/summarize them via the local Ollama chat model. dry_run (default true) returns the proposed plan without writing anything.",
+		InputSchema: schema(nil, map[string]string{"space": "string", "dry_run": "boolean"}),
+	},
 }
 
 func schema(required []string, props map[string]string) map[string]interface{} {
@@ -301,6 +375,182 @@ type nameDistance struct {
 	dist float64
 }
 
+// doSaveMemory chunks, embeds, and (re)writes content under (space, name),
+// replacing any existing chunks for that name. Shared by the save_memory
+// tool and compact_memories.
+func doSaveMemory(space, name, content string) (int, error) {
+	chunks := chunkContent(content)
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(`DELETE FROM memories WHERE space = $1 AND name = $2`, space, name); err != nil {
+		tx.Rollback()
+		return 0, err
+	}
+	for i, chunk := range chunks {
+		vec, err := embed(chunk)
+		if err != nil {
+			tx.Rollback()
+			return 0, err
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO memories (space, name, chunk_index, content, embedding, updated_at)
+			VALUES ($1, $2, $3, $4, $5::vector, now())
+		`, space, name, i, chunk, vectorLiteral(vec)); err != nil {
+			tx.Rollback()
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(chunks), nil
+}
+
+// memInfo is one memory's centroid embedding (average of its chunk
+// embeddings) and freshness, used to find compaction candidates.
+type memInfo struct {
+	space       string
+	name        string
+	centroid    []float64
+	lastUpdated time.Time
+}
+
+// compactGroupsForSpace groups a space's memories into compaction
+// candidates: connected components under the similarity threshold (any
+// chain of near-duplicate centroids), plus lone memories past the
+// staleness window (candidates for solo re-summarization).
+func compactGroupsForSpace(space string) ([][]memInfo, error) {
+	rows, err := db.Query(`SELECT name, avg(embedding)::text, max(updated_at) FROM memories WHERE space = $1 GROUP BY name`, space)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var infos []memInfo
+	for rows.Next() {
+		var name, centroidStr string
+		var lastUpdated time.Time
+		if err := rows.Scan(&name, &centroidStr, &lastUpdated); err != nil {
+			return nil, err
+		}
+		centroid, err := parseVectorLiteral(centroidStr)
+		if err != nil {
+			return nil, err
+		}
+		infos = append(infos, memInfo{space: space, name: name, centroid: centroid, lastUpdated: lastUpdated})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	threshold, staleDays := compactionSettings()
+	staleCutoff := time.Now().AddDate(0, 0, -staleDays)
+
+	parent := make([]int, len(infos))
+	for i := range parent {
+		parent[i] = i
+	}
+	var find func(int) int
+	find = func(i int) int {
+		if parent[i] != i {
+			parent[i] = find(parent[i])
+		}
+		return parent[i]
+	}
+	union := func(a, b int) {
+		ra, rb := find(a), find(b)
+		if ra != rb {
+			parent[ra] = rb
+		}
+	}
+	for i := 0; i < len(infos); i++ {
+		for j := i + 1; j < len(infos); j++ {
+			if cosineDistance(infos[i].centroid, infos[j].centroid) < threshold {
+				union(i, j)
+			}
+		}
+	}
+
+	byRoot := map[int][]int{}
+	for i := range infos {
+		r := find(i)
+		byRoot[r] = append(byRoot[r], i)
+	}
+	var groups [][]memInfo
+	for _, idxs := range byRoot {
+		if len(idxs) == 1 && infos[idxs[0]].lastUpdated.After(staleCutoff) {
+			continue // neither similar to a sibling nor stale: leave alone
+		}
+		g := make([]memInfo, len(idxs))
+		for k, idx := range idxs {
+			g[k] = infos[idx]
+		}
+		groups = append(groups, g)
+	}
+	return groups, nil
+}
+
+// compactTargetName picks the name a compacted group is saved under: the
+// original name for a solo re-summarization, or a "-merged" name when
+// multiple sources are combined.
+func compactTargetName(names []string) string {
+	if len(names) == 1 {
+		return names[0]
+	}
+	return names[0] + "-merged"
+}
+
+// compactGroup either describes (dry_run) or performs the merge of one
+// compaction group: reassemble each source, ask the Ollama chat model to
+// consolidate them, save the result, and delete the sources it replaced.
+func compactGroup(g []memInfo, dryRun bool) (string, error) {
+	names := make([]string, len(g))
+	for i, m := range g {
+		names[i] = m.name
+	}
+	newName := compactTargetName(names)
+
+	if dryRun {
+		reason := "similar"
+		if len(g) == 1 {
+			reason = "stale"
+		}
+		return fmt.Sprintf("space %q: [%s] -> would merge into %q (%s)", g[0].space, strings.Join(names, ", "), newName, reason), nil
+	}
+
+	var parts []string
+	for _, m := range g {
+		content, err := reassemble(m.space, m.name)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, fmt.Sprintf("--- %s ---\n%s", m.name, content))
+	}
+	prompt := fmt.Sprintf("The following are related notes. Merge them into a single consolidated note that preserves every distinct fact and drops redundancy. Respond with only the merged note text, no preamble.\n\n%s", strings.Join(parts, "\n\n"))
+	merged, err := ollamaChat(prompt)
+	if err != nil {
+		return "", err
+	}
+	merged = strings.TrimSpace(merged)
+	if merged == "" {
+		return "", fmt.Errorf("ollama returned an empty summary")
+	}
+	if _, err := doSaveMemory(g[0].space, newName, merged); err != nil {
+		return "", err
+	}
+	for _, m := range g {
+		if m.name == newName {
+			continue
+		}
+		if _, err := db.Exec(`DELETE FROM memories WHERE space = $1 AND name = $2`, m.space, m.name); err != nil {
+			return "", err
+		}
+	}
+	log.Printf("compact_memories: space=%q sources=%v -> %q via model=%q", g[0].space, names, newName, ollamaChatModel())
+	return fmt.Sprintf("space %q: merged [%s] into %q", g[0].space, strings.Join(names, ", "), newName), nil
+}
+
 func callTool(name string, args map[string]interface{}) map[string]interface{} {
 	switch name {
 	case "save_memory":
@@ -310,33 +560,11 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		if n == "" || content == "" {
 			return errResult("name and content are required")
 		}
-		chunks := chunkContent(content)
-		tx, err := db.Begin()
+		numChunks, err := doSaveMemory(space, n, content)
 		if err != nil {
-			return internalErr("save_memory begin", err)
+			return internalErr("save_memory", err)
 		}
-		if _, err := tx.Exec(`DELETE FROM memories WHERE space = $1 AND name = $2`, space, n); err != nil {
-			tx.Rollback()
-			return internalErr("save_memory delete", err)
-		}
-		for i, chunk := range chunks {
-			vec, err := embed(chunk)
-			if err != nil {
-				tx.Rollback()
-				return internalErr("save_memory embed", err)
-			}
-			if _, err := tx.Exec(`
-				INSERT INTO memories (space, name, chunk_index, content, embedding, updated_at)
-				VALUES ($1, $2, $3, $4, $5::vector, now())
-			`, space, n, i, chunk, vectorLiteral(vec)); err != nil {
-				tx.Rollback()
-				return internalErr("save_memory insert", err)
-			}
-		}
-		if err := tx.Commit(); err != nil {
-			return internalErr("save_memory commit", err)
-		}
-		return textResult(fmt.Sprintf("saved memory %q in space %q (%d bytes, %d chunk(s))", n, space, len(content), len(chunks)))
+		return textResult(fmt.Sprintf("saved memory %q in space %q (%d bytes, %d chunk(s))", n, space, len(content), numChunks))
 
 	case "get_memory":
 		n, _ := args["name"].(string)
@@ -473,6 +701,56 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			return errResult(fmt.Sprintf("memory %q not found in space %q", n, space))
 		}
 		return textResult(fmt.Sprintf("deleted memory %q from space %q", n, space))
+
+	case "compact_memories":
+		dryRun := true
+		if d, ok := args["dry_run"].(bool); ok {
+			dryRun = d
+		}
+		var spaces []string
+		if s, ok := args["space"].(string); ok && s != "" {
+			spaces = []string{s}
+		} else {
+			rows, err := db.Query(`SELECT DISTINCT space FROM memories ORDER BY space`)
+			if err != nil {
+				return internalErr("compact_memories spaces", err)
+			}
+			for rows.Next() {
+				var s string
+				if err := rows.Scan(&s); err != nil {
+					rows.Close()
+					return internalErr("compact_memories spaces scan", err)
+				}
+				spaces = append(spaces, s)
+			}
+			rows.Close()
+		}
+
+		var lines []string
+		for _, sp := range spaces {
+			groups, err := compactGroupsForSpace(sp)
+			if err != nil {
+				return internalErr("compact_memories groups", err)
+			}
+			for _, g := range groups {
+				line, err := compactGroup(g, dryRun)
+				if err != nil {
+					return internalErr("compact_memories merge", err)
+				}
+				lines = append(lines, line)
+			}
+		}
+		if len(lines) == 0 {
+			if dryRun {
+				return textResult("(no compaction candidates found)")
+			}
+			return textResult("(nothing to compact)")
+		}
+		verb := "would compact"
+		if !dryRun {
+			verb = "compacted"
+		}
+		return textResult(fmt.Sprintf("%s %d group(s):\n%s", verb, len(lines), strings.Join(lines, "\n")))
 
 	default:
 		return errResult(fmt.Sprintf("unknown tool %q", name))

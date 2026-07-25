@@ -14,11 +14,32 @@ Postgres/pgvector for storage and a local Ollama model (`all-minilm`,
 | `list_memories` | List stored memory names. |
 | `search_memories` | Hybrid (semantic + keyword + recency) search, top `limit` matches (default 5, max 20). |
 | `delete_memory` | Delete a memory by name. |
+| `compact_memories` | Merge/summarize near-duplicate or stale memories via the local Ollama chat model. |
 
 All tools accept an optional `space` argument (default `"default"`) to
 namespace memories — the same `name` can exist independently in different
 spaces. `list_memories` without a `space` lists everything grouped by
 space; with one, it lists just that space's memory names.
+
+## Compaction
+
+`compact_memories` keeps the vault from growing unbounded with stale or
+overlapping notes. Within a space (or all spaces, if `space` is omitted),
+it groups memories whose embeddings are near-duplicates (cosine distance
+under `COMPACT_SIMILARITY_THRESHOLD`) or that haven't been touched in
+`COMPACT_STALE_DAYS`, sends each group's reassembled content to a local
+Ollama **chat** model (`OLLAMA_CHAT_MODEL`, separate from the embedding
+model used for search/save), and asks it to produce one consolidated
+memory that preserves every distinct fact and drops redundancy. The
+result is re-chunked, re-embedded, and saved (under the original name for
+a solo re-summarization, or `<first-name>-merged` when multiple sources
+are combined); the memories it replaced are deleted.
+
+Call it with `dry_run: true` (the default) to see the proposed plan
+without writing anything, or `dry_run: false` to actually merge. It's
+manual/on-demand — there's no background cron. If you want it to run
+automatically, wire a periodic call to the tool into a cron job or an
+n8n/similar workflow.
 
 ## Resources
 
@@ -41,6 +62,7 @@ Environment variables:
 | `DATABASE_URL` | *(required)* | Postgres connection string, e.g. `postgres://user:pass@host:5432/dbname?sslmode=disable` |
 | `OLLAMA_URL` | `http://localhost:11434` | Base URL of the Ollama server |
 | `OLLAMA_EMBED_MODEL` | `all-minilm` | Ollama embedding model name |
+| `OLLAMA_CHAT_MODEL` | `llama3.1:8b` | Ollama chat model used only by `compact_memories` |
 | `PORT` | `8080` | HTTP listen port |
 | `AUTH_TOKEN` | *(none)* | Bearer token(s) required on `/mcp` (comma-separated for multiple clients). If unset, auth is disabled — set this in production. |
 | `ALLOWED_HOSTS` | *(none)* | Comma-separated `Host` header allowlist, guards against DNS-rebinding. If unset, the check is skipped — set this in production. |
@@ -51,6 +73,8 @@ Environment variables:
 | `SEARCH_WEIGHT_KEYWORD` | `0.0` | Weight of full-text (`ts_rank`) similarity |
 | `SEARCH_WEIGHT_RECENCY` | `0.0` | Weight of recency (exponential decay by `updated_at`) |
 | `SEARCH_RECENCY_HALFLIFE_DAYS` | `30` | Half-life, in days, for the recency decay factor |
+| `COMPACT_SIMILARITY_THRESHOLD` | `0.15` | Cosine-distance threshold under which two memories' embeddings are treated as near-duplicates by `compact_memories` |
+| `COMPACT_STALE_DAYS` | `90` | Age (in days since `updated_at`) past which a lone memory is still a `compact_memories` candidate for solo re-summarization |
 
 ## Run locally
 
