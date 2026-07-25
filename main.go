@@ -8,30 +8,20 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	_ "github.com/lib/pq"
+	"memory-vault/internal/store"
 )
 
-const embedDim = 384
-
-// chunkTargetWords/chunkOverlapWords approximate all-minilm's 256-token
-// budget via word count (~0.75 words/token), leaving headroom.
-const chunkTargetWords = 150
-const chunkOverlapWords = 15
-
-var db *sql.DB
+var st *store.Store
 
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -58,131 +48,72 @@ func envOrFloat(key string, fallback float64) float64 {
 	return fallback
 }
 
-func ollamaURL() string   { return envOr("OLLAMA_URL", "http://localhost:11434") }
-func ollamaModel() string { return envOr("OLLAMA_EMBED_MODEL", "all-minilm") }
+func ollamaURL() string       { return envOr("OLLAMA_URL", "http://localhost:11434") }
+func ollamaModel() string     { return envOr("OLLAMA_EMBED_MODEL", "all-minilm") }
+func ollamaChatModel() string { return envOr("OLLAMA_CHAT_MODEL", "llama3.1:8b") }
 
-func initDB() error {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		return fmt.Errorf("DATABASE_URL is not set")
+// compactionSettings returns the cosine-distance threshold under which two
+// memories' centroid embeddings are considered near-duplicates, and the
+// staleness window (in days) past which a lone memory is still a compaction
+// candidate (for re-summarization) even without a similar sibling.
+func compactionSettings() (similarityThreshold float64, staleDays int) {
+	return envOrFloat("COMPACT_SIMILARITY_THRESHOLD", 0.15), envOrInt("COMPACT_STALE_DAYS", 90)
+}
+
+func storeConfig() store.Config {
+	return store.Config{
+		DatabaseURL:      os.Getenv("DATABASE_URL"),
+		OllamaURL:        ollamaURL(),
+		OllamaEmbedModel: ollamaModel(),
+		MaxOpenConns:     envOrInt("DB_MAX_OPEN_CONNS", 10),
+		MaxIdleConns:     envOrInt("DB_MAX_IDLE_CONNS", 5),
+		ConnMaxLifetime:  time.Duration(envOrInt("DB_CONN_MAX_LIFETIME_MIN", 30)) * time.Minute,
 	}
-	var err error
-	db, err = sql.Open("postgres", dsn)
-	if err != nil {
-		return err
-	}
-	if err := db.Ping(); err != nil {
-		return err
-	}
-	db.SetMaxOpenConns(envOrInt("DB_MAX_OPEN_CONNS", 10))
-	db.SetMaxIdleConns(envOrInt("DB_MAX_IDLE_CONNS", 5))
-	db.SetConnMaxLifetime(time.Duration(envOrInt("DB_CONN_MAX_LIFETIME_MIN", 30)) * time.Minute)
-	_, err = db.Exec(`
-		CREATE EXTENSION IF NOT EXISTS vector;
-		CREATE TABLE IF NOT EXISTS memories (
-			space       TEXT NOT NULL DEFAULT 'default',
-			name        TEXT NOT NULL,
-			chunk_index INT NOT NULL DEFAULT 0,
-			content     TEXT NOT NULL,
-			embedding   vector(384) NOT NULL,
-			updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-			PRIMARY KEY (space, name, chunk_index)
-		);
-		ALTER TABLE memories ADD COLUMN IF NOT EXISTS chunk_index INT NOT NULL DEFAULT 0;
-		ALTER TABLE memories ADD COLUMN IF NOT EXISTS space TEXT NOT NULL DEFAULT 'default';
-		DO $$
-		BEGIN
-			IF (SELECT array_length(conkey, 1) FROM pg_constraint
-				WHERE conrelid = 'memories'::regclass AND contype = 'p') < 3 THEN
-				ALTER TABLE memories DROP CONSTRAINT memories_pkey;
-				ALTER TABLE memories ADD PRIMARY KEY (space, name, chunk_index);
-			END IF;
-		END $$;
-		CREATE INDEX IF NOT EXISTS memories_embedding_idx
-			ON memories USING hnsw (embedding vector_cosine_ops);
-		ALTER TABLE memories ADD COLUMN IF NOT EXISTS content_tsv tsvector
-			GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
-		CREATE INDEX IF NOT EXISTS memories_content_tsv_idx ON memories USING GIN (content_tsv);
-	`)
-	return err
 }
 
 // search scoring weights: default to semantic-only ranking (identical to
 // pre-hybrid-search behavior) unless overridden.
-func searchWeights() (semantic, keyword, recency, halfLifeDays float64) {
-	return envOrFloat("SEARCH_WEIGHT_SEMANTIC", 1.0),
-		envOrFloat("SEARCH_WEIGHT_KEYWORD", 0.0),
-		envOrFloat("SEARCH_WEIGHT_RECENCY", 0.0),
-		envOrFloat("SEARCH_RECENCY_HALFLIFE_DAYS", 30.0)
+func searchWeights() store.SearchWeights {
+	return store.SearchWeights{
+		Semantic:     envOrFloat("SEARCH_WEIGHT_SEMANTIC", 1.0),
+		Keyword:      envOrFloat("SEARCH_WEIGHT_KEYWORD", 0.0),
+		Recency:      envOrFloat("SEARCH_WEIGHT_RECENCY", 0.0),
+		HalfLifeDays: envOrFloat("SEARCH_RECENCY_HALFLIFE_DAYS", 30.0),
+	}
 }
-
-const defaultSpace = "default"
 
 func argSpace(args map[string]interface{}) string {
 	if s, ok := args["space"].(string); ok && s != "" {
 		return s
 	}
-	return defaultSpace
+	return store.DefaultSpace
 }
 
-// chunkContent splits content into overlapping word-based chunks that
-// safely fit all-minilm's 256-token context window. Reassembly (get_memory)
-// simply concatenates chunks back together; the small overlap is kept for
-// embedding quality and is not deduplicated on read.
-func chunkContent(content string) []string {
-	words := strings.Fields(content)
-	if len(words) <= chunkTargetWords {
-		return []string{content}
-	}
-	var chunks []string
-	start := 0
-	for start < len(words) {
-		end := start + chunkTargetWords
-		if end > len(words) {
-			end = len(words)
-		}
-		chunks = append(chunks, strings.Join(words[start:end], " "))
-		if end == len(words) {
-			break
-		}
-		start = end - chunkOverlapWords
-	}
-	return chunks
-}
-
-// embed calls a local Ollama server to turn text into a 384-dim vector.
-func embed(text string) ([]float32, error) {
-	reqBody, _ := json.Marshal(map[string]string{
-		"model":  ollamaModel(),
-		"prompt": text,
+// ollamaChat sends a single-turn prompt to the local Ollama chat model and
+// returns its response text. Used only by compact_memories, never search/save.
+func ollamaChat(prompt string) (string, error) {
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"model":    ollamaChatModel(),
+		"messages": []map[string]string{{"role": "user", "content": prompt}},
+		"stream":   false,
 	})
-	resp, err := http.Post(ollamaURL()+"/api/embeddings", "application/json", bytes.NewReader(reqBody))
+	resp, err := http.Post(ollamaURL()+"/api/chat", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
-		return nil, fmt.Errorf("ollama request failed (is Ollama running with %q pulled?): %w", ollamaModel(), err)
+		return "", fmt.Errorf("ollama chat request failed (is Ollama running with %q pulled?): %w", ollamaChatModel(), err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("ollama returned status %d", resp.StatusCode)
+		return "", fmt.Errorf("ollama chat returned status %d", resp.StatusCode)
 	}
 	var out struct {
-		Embedding []float32 `json:"embedding"`
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
+		return "", err
 	}
-	if len(out.Embedding) != embedDim {
-		return nil, fmt.Errorf("expected %d-dim embedding, got %d", embedDim, len(out.Embedding))
-	}
-	return out.Embedding, nil
-}
-
-// vectorLiteral formats a float32 slice as pgvector's text input format, e.g. "[0.1,0.2,0.3]".
-func vectorLiteral(v []float32) string {
-	parts := make([]string, len(v))
-	for i, f := range v {
-		parts[i] = fmt.Sprintf("%g", f)
-	}
-	return "[" + strings.Join(parts, ",") + "]"
+	return out.Message.Content, nil
 }
 
 // --- JSON-RPC plumbing ---
@@ -248,6 +179,11 @@ var tools = []tool{
 		Description: "Delete a memory by name, optionally scoped to a space (default: \"default\").",
 		InputSchema: schema([]string{"name"}, map[string]string{"name": "string", "space": "string"}),
 	},
+	{
+		Name:        "compact_memories",
+		Description: "Find near-duplicate or stale memories (within a space, or all spaces if omitted) and merge/summarize them via the local Ollama chat model. dry_run (default true) returns the proposed plan without writing anything.",
+		InputSchema: schema(nil, map[string]string{"space": "string", "dry_run": "boolean"}),
+	},
 }
 
 func schema(required []string, props map[string]string) map[string]interface{} {
@@ -277,28 +213,121 @@ func internalErr(context string, err error) map[string]interface{} {
 	return errResult("internal error")
 }
 
-// reassemble fetches all chunks for (space, name) ordered by chunk_index
-// and joins them back into the original content.
-func reassemble(space, name string) (string, error) {
-	rows, err := db.Query(`SELECT content FROM memories WHERE space = $1 AND name = $2 ORDER BY chunk_index`, space, name)
+// compactTargetName picks the name a compacted group is saved under: the
+// original name for a solo re-summarization, or a "-merged" name when
+// multiple sources are combined.
+func compactTargetName(names []string) string {
+	if len(names) == 1 {
+		return names[0]
+	}
+	return names[0] + "-merged"
+}
+
+// compactGroupsForSpace groups a space's memories into compaction
+// candidates: connected components under the similarity threshold (any
+// chain of near-duplicate centroids), plus lone memories past the
+// staleness window (candidates for solo re-summarization).
+func compactGroupsForSpace(space string) ([][]store.MemoryCentroid, error) {
+	infos, err := st.MemoryCentroids(space)
+	if err != nil {
+		return nil, err
+	}
+
+	threshold, staleDays := compactionSettings()
+	staleCutoff := time.Now().AddDate(0, 0, -staleDays)
+
+	parent := make([]int, len(infos))
+	for i := range parent {
+		parent[i] = i
+	}
+	var find func(int) int
+	find = func(i int) int {
+		if parent[i] != i {
+			parent[i] = find(parent[i])
+		}
+		return parent[i]
+	}
+	union := func(a, b int) {
+		ra, rb := find(a), find(b)
+		if ra != rb {
+			parent[ra] = rb
+		}
+	}
+	for i := 0; i < len(infos); i++ {
+		for j := i + 1; j < len(infos); j++ {
+			if store.CosineDistance(infos[i].Centroid, infos[j].Centroid) < threshold {
+				union(i, j)
+			}
+		}
+	}
+
+	byRoot := map[int][]int{}
+	for i := range infos {
+		r := find(i)
+		byRoot[r] = append(byRoot[r], i)
+	}
+	var groups [][]store.MemoryCentroid
+	for _, idxs := range byRoot {
+		if len(idxs) == 1 && infos[idxs[0]].LastUpdated.After(staleCutoff) {
+			continue // neither similar to a sibling nor stale: leave alone
+		}
+		g := make([]store.MemoryCentroid, len(idxs))
+		for k, idx := range idxs {
+			g[k] = infos[idx]
+		}
+		groups = append(groups, g)
+	}
+	return groups, nil
+}
+
+// compactGroup either describes (dry_run) or performs the merge of one
+// compaction group: reassemble each source, ask the Ollama chat model to
+// consolidate them, save the result, and delete the sources it replaced.
+func compactGroup(space string, g []store.MemoryCentroid, dryRun bool) (string, error) {
+	names := make([]string, len(g))
+	for i, m := range g {
+		names[i] = m.Name
+	}
+	newName := compactTargetName(names)
+
+	if dryRun {
+		reason := "similar"
+		if len(g) == 1 {
+			reason = "stale"
+		}
+		return fmt.Sprintf("space %q: [%s] -> would merge into %q (%s)", space, strings.Join(names, ", "), newName, reason), nil
+	}
+
+	var parts []string
+	for _, m := range g {
+		content, err := st.Reassemble(space, m.Name)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, fmt.Sprintf("--- %s ---\n%s", m.Name, content))
+	}
+	prompt := fmt.Sprintf("The following are related notes. Merge them into a single consolidated note that preserves every distinct fact and drops redundancy. Respond with only the merged note text, no preamble.\n\n%s", strings.Join(parts, "\n\n"))
+	merged, err := ollamaChat(prompt)
 	if err != nil {
 		return "", err
 	}
-	defer rows.Close()
-	var parts []string
-	for rows.Next() {
-		var c string
-		if err := rows.Scan(&c); err != nil {
+	merged = strings.TrimSpace(merged)
+	if merged == "" {
+		return "", fmt.Errorf("ollama returned an empty summary")
+	}
+	if _, err := st.SaveMemory(space, newName, merged); err != nil {
+		return "", err
+	}
+	for _, m := range g {
+		if m.Name == newName {
+			continue
+		}
+		if _, err := st.DeleteMemory(space, m.Name); err != nil {
 			return "", err
 		}
-		parts = append(parts, c)
 	}
-	return strings.Join(parts, " "), nil
-}
-
-type nameDistance struct {
-	name string
-	dist float64
+	log.Printf("compact_memories: space=%q sources=%v -> %q via model=%q", space, names, newName, ollamaChatModel())
+	return fmt.Sprintf("space %q: merged [%s] into %q", space, strings.Join(names, ", "), newName), nil
 }
 
 func callTool(name string, args map[string]interface{}) map[string]interface{} {
@@ -310,38 +339,16 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		if n == "" || content == "" {
 			return errResult("name and content are required")
 		}
-		chunks := chunkContent(content)
-		tx, err := db.Begin()
+		numChunks, err := st.SaveMemory(space, n, content)
 		if err != nil {
-			return internalErr("save_memory begin", err)
+			return internalErr("save_memory", err)
 		}
-		if _, err := tx.Exec(`DELETE FROM memories WHERE space = $1 AND name = $2`, space, n); err != nil {
-			tx.Rollback()
-			return internalErr("save_memory delete", err)
-		}
-		for i, chunk := range chunks {
-			vec, err := embed(chunk)
-			if err != nil {
-				tx.Rollback()
-				return internalErr("save_memory embed", err)
-			}
-			if _, err := tx.Exec(`
-				INSERT INTO memories (space, name, chunk_index, content, embedding, updated_at)
-				VALUES ($1, $2, $3, $4, $5::vector, now())
-			`, space, n, i, chunk, vectorLiteral(vec)); err != nil {
-				tx.Rollback()
-				return internalErr("save_memory insert", err)
-			}
-		}
-		if err := tx.Commit(); err != nil {
-			return internalErr("save_memory commit", err)
-		}
-		return textResult(fmt.Sprintf("saved memory %q in space %q (%d bytes, %d chunk(s))", n, space, len(content), len(chunks)))
+		return textResult(fmt.Sprintf("saved memory %q in space %q (%d bytes, %d chunk(s))", n, space, len(content), numChunks))
 
 	case "get_memory":
 		n, _ := args["name"].(string)
 		space := argSpace(args)
-		content, err := reassemble(space, n)
+		content, err := st.Reassemble(space, n)
 		if err != nil {
 			return internalErr("get_memory query", err)
 		}
@@ -352,18 +359,9 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 
 	case "list_memories":
 		if s, ok := args["space"].(string); ok && s != "" {
-			rows, err := db.Query(`SELECT DISTINCT name FROM memories WHERE space = $1 ORDER BY name`, s)
+			names, err := st.ListMemoryNames(s)
 			if err != nil {
 				return internalErr("list_memories query", err)
-			}
-			defer rows.Close()
-			var names []string
-			for rows.Next() {
-				var n string
-				if err := rows.Scan(&n); err != nil {
-					return internalErr("list_memories scan", err)
-				}
-				names = append(names, n)
 			}
 			if len(names) == 0 {
 				return textResult(fmt.Sprintf("(no memories yet in space %q)", s))
@@ -371,23 +369,18 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			return textResult(strings.Join(names, "\n"))
 		}
 
-		rows, err := db.Query(`SELECT DISTINCT space, name FROM memories ORDER BY space, name`)
+		all, err := st.ListAll()
 		if err != nil {
 			return internalErr("list_memories query", err)
 		}
-		defer rows.Close()
 		var lines []string
 		curSpace := ""
-		for rows.Next() {
-			var s, n string
-			if err := rows.Scan(&s, &n); err != nil {
-				return internalErr("list_memories scan", err)
+		for _, sn := range all {
+			if sn.Space != curSpace {
+				lines = append(lines, fmt.Sprintf("[%s]", sn.Space))
+				curSpace = sn.Space
 			}
-			if s != curSpace {
-				lines = append(lines, fmt.Sprintf("[%s]", s))
-				curSpace = s
-			}
-			lines = append(lines, "  "+n)
+			lines = append(lines, "  "+sn.Name)
 		}
 		if len(lines) == 0 {
 			return textResult("(no memories yet)")
@@ -407,72 +400,72 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		if limit > 20 {
 			limit = 20
 		}
-		vec, err := embed(q)
+		matches, err := st.SearchMemories(space, q, limit, searchWeights())
 		if err != nil {
-			return internalErr("search_memories embed", err)
-		}
-		semanticW, keywordW, recencyW, halfLife := searchWeights()
-		rows, err := db.Query(`
-			SELECT name, embedding <=> $1::vector AS distance,
-			       ts_rank(content_tsv, plainto_tsquery('english', $2)) AS rank,
-			       updated_at
-			FROM memories
-			WHERE space = $3
-			ORDER BY distance ASC
-			LIMIT $4
-		`, vectorLiteral(vec), q, space, limit*5)
-		if err != nil {
-			return internalErr("search_memories query", err)
-		}
-		best := map[string]nameDistance{}
-		for rows.Next() {
-			var n string
-			var dist, rank float64
-			var updatedAt time.Time
-			if err := rows.Scan(&n, &dist, &rank, &updatedAt); err != nil {
-				rows.Close()
-				return internalErr("search_memories scan", err)
-			}
-			days := time.Since(updatedAt).Hours() / 24
-			recency := math.Exp(-math.Ln2 * days / halfLife)
-			score := semanticW*(1-dist) + keywordW*rank + recencyW*recency
-			if cur, ok := best[n]; !ok || score > cur.dist {
-				best[n] = nameDistance{name: n, dist: score}
-			}
-		}
-		rows.Close()
-		matches := make([]nameDistance, 0, len(best))
-		for _, m := range best {
-			matches = append(matches, m)
-		}
-		sort.Slice(matches, func(i, j int) bool { return matches[i].dist > matches[j].dist })
-		if len(matches) > limit {
-			matches = matches[:limit]
+			return internalErr("search_memories", err)
 		}
 		if len(matches) == 0 {
 			return textResult("(no matches)")
 		}
 		var out []string
 		for _, m := range matches {
-			content, err := reassemble(space, m.name)
-			if err != nil {
-				return internalErr("search_memories reassemble", err)
-			}
-			out = append(out, fmt.Sprintf("%s (score %.4f): %s", m.name, m.dist, content))
+			out = append(out, fmt.Sprintf("%s (score %.4f): %s", m.Name, m.Score, m.Content))
 		}
 		return textResult(strings.Join(out, "\n\n"))
 
 	case "delete_memory":
 		n, _ := args["name"].(string)
 		space := argSpace(args)
-		res, err := db.Exec(`DELETE FROM memories WHERE space = $1 AND name = $2`, space, n)
+		found, err := st.DeleteMemory(space, n)
 		if err != nil {
 			return internalErr("delete_memory exec", err)
 		}
-		if affected, _ := res.RowsAffected(); affected == 0 {
+		if !found {
 			return errResult(fmt.Sprintf("memory %q not found in space %q", n, space))
 		}
 		return textResult(fmt.Sprintf("deleted memory %q from space %q", n, space))
+
+	case "compact_memories":
+		dryRun := true
+		if d, ok := args["dry_run"].(bool); ok {
+			dryRun = d
+		}
+		var spaces []string
+		if s, ok := args["space"].(string); ok && s != "" {
+			spaces = []string{s}
+		} else {
+			var err error
+			spaces, err = st.Spaces()
+			if err != nil {
+				return internalErr("compact_memories spaces", err)
+			}
+		}
+
+		var lines []string
+		for _, sp := range spaces {
+			groups, err := compactGroupsForSpace(sp)
+			if err != nil {
+				return internalErr("compact_memories groups", err)
+			}
+			for _, g := range groups {
+				line, err := compactGroup(sp, g, dryRun)
+				if err != nil {
+					return internalErr("compact_memories merge", err)
+				}
+				lines = append(lines, line)
+			}
+		}
+		if len(lines) == 0 {
+			if dryRun {
+				return textResult("(no compaction candidates found)")
+			}
+			return textResult("(nothing to compact)")
+		}
+		verb := "would compact"
+		if !dryRun {
+			verb = "compacted"
+		}
+		return textResult(fmt.Sprintf("%s %d group(s):\n%s", verb, len(lines), strings.Join(lines, "\n")))
 
 	default:
 		return errResult(fmt.Sprintf("unknown tool %q", name))
@@ -494,20 +487,14 @@ func resourceURI(space, name string) string {
 var errNotFound = fmt.Errorf("not found")
 
 func listResources() (interface{}, error) {
-	rows, err := db.Query(`SELECT DISTINCT space, name FROM memories ORDER BY space, name`)
+	all, err := st.ListAll()
 	if err != nil {
 		log.Printf("resources/list query: %v", err)
 		return nil, fmt.Errorf("internal error")
 	}
-	defer rows.Close()
 	res := []resource{}
-	for rows.Next() {
-		var s, n string
-		if err := rows.Scan(&s, &n); err != nil {
-			log.Printf("resources/list scan: %v", err)
-			return nil, fmt.Errorf("internal error")
-		}
-		res = append(res, resource{URI: resourceURI(s, n), Name: fmt.Sprintf("%s/%s", s, n), MimeType: "text/plain"})
+	for _, sn := range all {
+		res = append(res, resource{URI: resourceURI(sn.Space, sn.Name), Name: fmt.Sprintf("%s/%s", sn.Space, sn.Name), MimeType: "text/plain"})
 	}
 	return map[string]interface{}{"resources": res}, nil
 }
@@ -527,7 +514,7 @@ func readResource(uri string) (interface{}, error) {
 	if !ok {
 		return nil, fmt.Errorf("invalid resource uri %q", uri)
 	}
-	content, err := reassemble(space, name)
+	content, err := st.Reassemble(space, name)
 	if err != nil {
 		log.Printf("resources/read query: %v", err)
 		return nil, fmt.Errorf("internal error")
@@ -551,7 +538,7 @@ func handle(req request) *response {
 				"tools":     map[string]interface{}{},
 				"resources": map[string]interface{}{},
 			},
-			"serverInfo": map[string]string{"name": "memory-vault", "version": "0.5.0"},
+			"serverInfo": map[string]string{"name": "memory-vault", "version": "0.6.0"},
 		})
 
 	case "notifications/initialized":
@@ -701,10 +688,12 @@ func mcpHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	if err := initDB(); err != nil {
+	var err error
+	st, err = store.Open(storeConfig())
+	if err != nil {
 		log.Fatalf("db init failed: %v", err)
 	}
-	defer db.Close()
+	defer st.Close()
 
 	addr := ":" + envOr("PORT", "8080")
 	http.HandleFunc("/mcp", mcpHandler)

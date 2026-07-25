@@ -3,6 +3,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY main.go ./
+COPY internal/ ./internal/
 RUN CGO_ENABLED=0 go build -o /memory-vault .
 
 FROM scratch

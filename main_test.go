@@ -5,12 +5,14 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"memory-vault/internal/store"
 )
 
 func TestChunkContent(t *testing.T) {
 	short := "just a few words"
-	if got := chunkContent(short); len(got) != 1 || got[0] != short {
-		t.Errorf("chunkContent(short) = %v, want single unchanged chunk", got)
+	if got := store.ChunkContent(short); len(got) != 1 || got[0] != short {
+		t.Errorf("ChunkContent(short) = %v, want single unchanged chunk", got)
 	}
 
 	words := make([]string, 500)
@@ -18,10 +20,11 @@ func TestChunkContent(t *testing.T) {
 		words[i] = "w"
 	}
 	long := strings.Join(words, " ")
-	chunks := chunkContent(long)
+	chunks := store.ChunkContent(long)
 	if len(chunks) < 2 {
-		t.Fatalf("chunkContent(long) = %d chunks, want >1", len(chunks))
+		t.Fatalf("ChunkContent(long) = %d chunks, want >1", len(chunks))
 	}
+	const chunkTargetWords = 150 // mirrors store's internal target
 	for _, c := range chunks {
 		n := len(strings.Fields(c))
 		if n > chunkTargetWords {
@@ -111,8 +114,10 @@ func setupIntegrationDB(t *testing.T) {
 	if os.Getenv("DATABASE_URL") == "" || os.Getenv("OLLAMA_URL") == "" {
 		t.Skip("DATABASE_URL/OLLAMA_URL not set, skipping integration test")
 	}
-	if err := initDB(); err != nil {
-		t.Fatalf("initDB: %v", err)
+	var err error
+	st, err = store.Open(storeConfig())
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
 	}
 }
 
