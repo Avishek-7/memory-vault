@@ -54,6 +54,21 @@ hardware you control.
   or under the scrutiny mem0/Zep have — read the code before trusting it
   with anything sensitive.
 
+## Quickstart
+
+```
+docker compose up
+```
+
+That builds `memory-vault` and brings up Postgres/pgvector and Ollama
+alongside it, pulling the embedding and chat models on first run (a few
+minutes — Ollama has no models pre-pulled). Once it's up, point an MCP
+client at `http://localhost:8080/mcp` (see
+[Connecting an MCP client](#connecting-an-mcp-client) below). Copy
+`.env.example` to `.env` first if you want to set `AUTH_TOKEN`,
+`ALLOWED_HOSTS`, or different Ollama models — otherwise the defaults
+(no auth, `all-minilm` / `llama3.1:8b`) apply.
+
 ## Tools
 
 | Tool | Description |
