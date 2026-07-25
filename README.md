@@ -1,9 +1,58 @@
 # memory-vault
 
-A minimal MCP server exposing persistent memory tools to LLMs, backed by
-Postgres/pgvector for storage and a local Ollama model (`all-minilm`,
-384-dim) for embeddings. Talks the MCP Streamable HTTP transport
-(`POST /mcp`).
+An MCP server that gives LLMs persistent, searchable memory, backed by
+Postgres/pgvector and a local Ollama model for embeddings. It ships as a
+single static Go binary — no Python runtime, no Node, no separate vector
+DB service beyond Postgres. Everything that touches a model (embeddings
+for search/save, summarization for compaction) calls a local Ollama
+server; nothing here calls an external LLM API unless you opt into one
+(see [Using a different embedding backend](#using-a-different-embedding-backend)).
+Memories don't just accumulate — `compact_memories` finds near-duplicate
+or stale entries and merges them, on demand. There's also a terminal UI
+(`memory-vault-tui`) for browsing, searching, editing, and deleting
+memories directly, without going through an MCP client. Talks the MCP
+Streamable HTTP transport (`POST /mcp`) and exposes both `tools/*` and
+`resources/*`.
+
+## Why this instead of X
+
+There are more mature, more featureful memory layers out there — this is
+a smaller, simpler tool that trades breadth for being self-contained and
+easy to run yourself. Fair comparison, not a sales pitch:
+
+| | memory-vault | [mem0](https://github.com/mem0ai/mem0) | [Zep](https://www.getzep.com/) |
+|---|---|---|---|
+| Runtime | Single static Go binary | Python/TS library or self-hosted server | Managed platform (Python service); self-hosted Community Edition retired in 2025 |
+| Fully local, no external API key required | Yes — Ollama only | Yes, if self-hosted against a local Ollama + local vector store | No — cloud/managed by default; full self-host no longer offered |
+| Vector backend | Postgres/pgvector only | Many: Qdrant, Chroma, Weaviate, Milvus, pgvector, Redis, and more | Proprietary temporal graph engine (Graphiti, open source on its own) |
+| Memory model | Flat text memories, namespaced by space | LLM-extracted facts/entities with automatic dedup on write | Temporal knowledge graph (tracks how facts change over time) |
+| Prunes/compacts memories | Yes — explicit `compact_memories` tool, on demand | Partial — fact-level dedup happens automatically as memories are written | Not really — the graph grows and versions facts over time instead of merging them |
+| Terminal UI | Yes | No | No |
+| License | MIT | Apache-2.0 | Apache-2.0 (Graphiti only; Zep itself is commercial) |
+
+If you need multiple vector backends, framework integrations (LangChain,
+CrewAI, etc.), or entity/relationship-level temporal reasoning, mem0 or
+Zep/Graphiti are more capable choices. memory-vault is for when you want
+something small enough to read in one sitting, running entirely on
+hardware you control.
+
+## Tradeoffs / not a fit if...
+
+- **Single-node Postgres.** There's no built-in replication, sharding,
+  or HA — if you need that, you're running your own Postgres cluster in
+  front of this.
+- **No multi-tenant auth.** `AUTH_TOKEN` is a shared bearer token (or a
+  comma-separated list of them) checked with a constant-time compare —
+  there's no per-user identity, ACLs, or RBAC. Spaces namespace
+  memories, but anyone with a valid token can read/write any space.
+- **No entity or relationship modeling.** Memories are chunked text with
+  embeddings, not a knowledge graph — there's no notion of "this fact
+  superseded that one" beyond what `compact_memories` merges.
+- **Compaction is manual.** `compact_memories` doesn't run on a
+  schedule; you call it (or wire it into your own cron/workflow).
+- **Small, single-maintainer project.** It hasn't been run at the scale
+  or under the scrutiny mem0/Zep have — read the code before trusting it
+  with anything sensitive.
 
 ## Tools
 
