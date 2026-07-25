@@ -1,5 +1,9 @@
 # memory-vault
 
+[![CI](https://github.com/Avishek-7/memory-vault/actions/workflows/ci.yml/badge.svg)](https://github.com/Avishek-7/memory-vault/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/github/license/Avishek-7/memory-vault)](LICENSE)
+[![Go 1.26](https://img.shields.io/badge/go-1.26-00ADD8?logo=go&logoColor=white)](go.mod)
+
 An MCP server that gives LLMs persistent, searchable memory, backed by
 Postgres/pgvector and a local Ollama model for embeddings. It ships as a
 single static Go binary — no Python runtime, no Node, no separate vector
