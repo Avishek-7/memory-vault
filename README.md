@@ -9,11 +9,16 @@ Postgres/pgvector for storage and a local Ollama model (`all-minilm`,
 
 | Tool | Description |
 |---|---|
-| `save_memory` | Create or overwrite a memory by name. Embeds the content for semantic search. |
+| `save_memory` | Create or overwrite a memory by name. Chunks and embeds the content for semantic search. |
 | `get_memory` | Fetch a memory's content by exact name. |
-| `list_memories` | List all stored memory names. |
+| `list_memories` | List stored memory names. |
 | `search_memories` | Semantic search via pgvector cosine distance, top 5 matches. |
 | `delete_memory` | Delete a memory by name. |
+
+All tools accept an optional `space` argument (default `"default"`) to
+namespace memories — the same `name` can exist independently in different
+spaces. `list_memories` without a `space` lists everything grouped by
+space; with one, it lists just that space's memory names.
 
 ## Requirements
 

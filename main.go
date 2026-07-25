@@ -70,26 +70,37 @@ func initDB() error {
 	_, err = db.Exec(`
 		CREATE EXTENSION IF NOT EXISTS vector;
 		CREATE TABLE IF NOT EXISTS memories (
+			space       TEXT NOT NULL DEFAULT 'default',
 			name        TEXT NOT NULL,
 			chunk_index INT NOT NULL DEFAULT 0,
 			content     TEXT NOT NULL,
 			embedding   vector(384) NOT NULL,
 			updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-			PRIMARY KEY (name, chunk_index)
+			PRIMARY KEY (space, name, chunk_index)
 		);
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS chunk_index INT NOT NULL DEFAULT 0;
+		ALTER TABLE memories ADD COLUMN IF NOT EXISTS space TEXT NOT NULL DEFAULT 'default';
 		DO $$
 		BEGIN
 			IF (SELECT array_length(conkey, 1) FROM pg_constraint
-				WHERE conrelid = 'memories'::regclass AND contype = 'p') = 1 THEN
+				WHERE conrelid = 'memories'::regclass AND contype = 'p') < 3 THEN
 				ALTER TABLE memories DROP CONSTRAINT memories_pkey;
-				ALTER TABLE memories ADD PRIMARY KEY (name, chunk_index);
+				ALTER TABLE memories ADD PRIMARY KEY (space, name, chunk_index);
 			END IF;
 		END $$;
 		CREATE INDEX IF NOT EXISTS memories_embedding_idx
 			ON memories USING hnsw (embedding vector_cosine_ops);
 	`)
 	return err
+}
+
+const defaultSpace = "default"
+
+func argSpace(args map[string]interface{}) string {
+	if s, ok := args["space"].(string); ok && s != "" {
+		return s
+	}
+	return defaultSpace
 }
 
 // chunkContent splits content into overlapping word-based chunks that
@@ -192,28 +203,28 @@ type tool struct {
 var tools = []tool{
 	{
 		Name:        "save_memory",
-		Description: "Create or overwrite a memory by name with the given content. Content is chunked and embedded via Ollama for later semantic search.",
-		InputSchema: schema([]string{"name", "content"}, map[string]string{"name": "string", "content": "string"}),
+		Description: "Create or overwrite a memory by name with the given content, optionally in a named space (default: \"default\"). Content is chunked and embedded via Ollama for later semantic search.",
+		InputSchema: schema([]string{"name", "content"}, map[string]string{"name": "string", "content": "string", "space": "string"}),
 	},
 	{
 		Name:        "get_memory",
-		Description: "Fetch the content of a memory by exact name.",
-		InputSchema: schema([]string{"name"}, map[string]string{"name": "string"}),
+		Description: "Fetch the content of a memory by exact name, optionally scoped to a space (default: \"default\").",
+		InputSchema: schema([]string{"name"}, map[string]string{"name": "string", "space": "string"}),
 	},
 	{
 		Name:        "list_memories",
-		Description: "List the names of all stored memories.",
-		InputSchema: schema(nil, nil),
+		Description: "List the names of stored memories. Pass space to filter to one space; omit it to list all memories grouped by space.",
+		InputSchema: schema(nil, map[string]string{"space": "string"}),
 	},
 	{
 		Name:        "search_memories",
-		Description: "Semantic search over stored memories using pgvector cosine distance. Returns the closest matches with their full content.",
-		InputSchema: schema([]string{"query"}, map[string]string{"query": "string"}),
+		Description: "Semantic search over stored memories in a space (default: \"default\") using pgvector cosine distance. Returns the closest matches with their full content.",
+		InputSchema: schema([]string{"query"}, map[string]string{"query": "string", "space": "string"}),
 	},
 	{
 		Name:        "delete_memory",
-		Description: "Delete a memory by name.",
-		InputSchema: schema([]string{"name"}, map[string]string{"name": "string"}),
+		Description: "Delete a memory by name, optionally scoped to a space (default: \"default\").",
+		InputSchema: schema([]string{"name"}, map[string]string{"name": "string", "space": "string"}),
 	},
 }
 
@@ -244,10 +255,10 @@ func internalErr(context string, err error) map[string]interface{} {
 	return errResult("internal error")
 }
 
-// reassemble fetches all chunks for name ordered by chunk_index and joins
-// them back into the original content.
-func reassemble(name string) (string, error) {
-	rows, err := db.Query(`SELECT content FROM memories WHERE name = $1 ORDER BY chunk_index`, name)
+// reassemble fetches all chunks for (space, name) ordered by chunk_index
+// and joins them back into the original content.
+func reassemble(space, name string) (string, error) {
+	rows, err := db.Query(`SELECT content FROM memories WHERE space = $1 AND name = $2 ORDER BY chunk_index`, space, name)
 	if err != nil {
 		return "", err
 	}
@@ -277,6 +288,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 	case "save_memory":
 		n, _ := args["name"].(string)
 		content, _ := args["content"].(string)
+		space := argSpace(args)
 		if n == "" || content == "" {
 			return errResult("name and content are required")
 		}
@@ -285,7 +297,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		if err != nil {
 			return internalErr("save_memory begin", err)
 		}
-		if _, err := tx.Exec(`DELETE FROM memories WHERE name = $1`, n); err != nil {
+		if _, err := tx.Exec(`DELETE FROM memories WHERE space = $1 AND name = $2`, space, n); err != nil {
 			tx.Rollback()
 			return internalErr("save_memory delete", err)
 		}
@@ -296,9 +308,9 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 				return internalErr("save_memory embed", err)
 			}
 			if _, err := tx.Exec(`
-				INSERT INTO memories (name, chunk_index, content, embedding, updated_at)
-				VALUES ($1, $2, $3, $4::vector, now())
-			`, n, i, chunk, vectorLiteral(vec)); err != nil {
+				INSERT INTO memories (space, name, chunk_index, content, embedding, updated_at)
+				VALUES ($1, $2, $3, $4, $5::vector, now())
+			`, space, n, i, chunk, vectorLiteral(vec)); err != nil {
 				tx.Rollback()
 				return internalErr("save_memory insert", err)
 			}
@@ -306,40 +318,67 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		if err := tx.Commit(); err != nil {
 			return internalErr("save_memory commit", err)
 		}
-		return textResult(fmt.Sprintf("saved memory %q (%d bytes, %d chunk(s))", n, len(content), len(chunks)))
+		return textResult(fmt.Sprintf("saved memory %q in space %q (%d bytes, %d chunk(s))", n, space, len(content), len(chunks)))
 
 	case "get_memory":
 		n, _ := args["name"].(string)
-		content, err := reassemble(n)
+		space := argSpace(args)
+		content, err := reassemble(space, n)
 		if err != nil {
 			return internalErr("get_memory query", err)
 		}
 		if content == "" {
-			return errResult(fmt.Sprintf("memory %q not found", n))
+			return errResult(fmt.Sprintf("memory %q not found in space %q", n, space))
 		}
 		return textResult(content)
 
 	case "list_memories":
-		rows, err := db.Query(`SELECT DISTINCT name FROM memories ORDER BY name`)
+		if s, ok := args["space"].(string); ok && s != "" {
+			rows, err := db.Query(`SELECT DISTINCT name FROM memories WHERE space = $1 ORDER BY name`, s)
+			if err != nil {
+				return internalErr("list_memories query", err)
+			}
+			defer rows.Close()
+			var names []string
+			for rows.Next() {
+				var n string
+				if err := rows.Scan(&n); err != nil {
+					return internalErr("list_memories scan", err)
+				}
+				names = append(names, n)
+			}
+			if len(names) == 0 {
+				return textResult(fmt.Sprintf("(no memories yet in space %q)", s))
+			}
+			return textResult(strings.Join(names, "\n"))
+		}
+
+		rows, err := db.Query(`SELECT DISTINCT space, name FROM memories ORDER BY space, name`)
 		if err != nil {
 			return internalErr("list_memories query", err)
 		}
 		defer rows.Close()
-		var names []string
+		var lines []string
+		curSpace := ""
 		for rows.Next() {
-			var n string
-			if err := rows.Scan(&n); err != nil {
+			var s, n string
+			if err := rows.Scan(&s, &n); err != nil {
 				return internalErr("list_memories scan", err)
 			}
-			names = append(names, n)
+			if s != curSpace {
+				lines = append(lines, fmt.Sprintf("[%s]", s))
+				curSpace = s
+			}
+			lines = append(lines, "  "+n)
 		}
-		if len(names) == 0 {
+		if len(lines) == 0 {
 			return textResult("(no memories yet)")
 		}
-		return textResult(strings.Join(names, "\n"))
+		return textResult(strings.Join(lines, "\n"))
 
 	case "search_memories":
 		q, _ := args["query"].(string)
+		space := argSpace(args)
 		if q == "" {
 			return errResult("query is required")
 		}
@@ -350,8 +389,9 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		rows, err := db.Query(`
 			SELECT DISTINCT ON (name) name, embedding <=> $1::vector AS distance
 			FROM memories
+			WHERE space = $2
 			ORDER BY name, distance ASC
-		`, vectorLiteral(vec))
+		`, vectorLiteral(vec), space)
 		if err != nil {
 			return internalErr("search_memories query", err)
 		}
@@ -374,7 +414,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		}
 		var out []string
 		for _, m := range matches {
-			content, err := reassemble(m.name)
+			content, err := reassemble(space, m.name)
 			if err != nil {
 				return internalErr("search_memories reassemble", err)
 			}
@@ -384,14 +424,15 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 
 	case "delete_memory":
 		n, _ := args["name"].(string)
-		res, err := db.Exec(`DELETE FROM memories WHERE name = $1`, n)
+		space := argSpace(args)
+		res, err := db.Exec(`DELETE FROM memories WHERE space = $1 AND name = $2`, space, n)
 		if err != nil {
 			return internalErr("delete_memory exec", err)
 		}
 		if affected, _ := res.RowsAffected(); affected == 0 {
-			return errResult(fmt.Sprintf("memory %q not found", n))
+			return errResult(fmt.Sprintf("memory %q not found in space %q", n, space))
 		}
-		return textResult(fmt.Sprintf("deleted memory %q", n))
+		return textResult(fmt.Sprintf("deleted memory %q from space %q", n, space))
 
 	default:
 		return errResult(fmt.Sprintf("unknown tool %q", name))
