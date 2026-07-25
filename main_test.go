@@ -2,8 +2,32 @@ package main
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
+
+func TestChunkContent(t *testing.T) {
+	short := "just a few words"
+	if got := chunkContent(short); len(got) != 1 || got[0] != short {
+		t.Errorf("chunkContent(short) = %v, want single unchanged chunk", got)
+	}
+
+	words := make([]string, 500)
+	for i := range words {
+		words[i] = "w"
+	}
+	long := strings.Join(words, " ")
+	chunks := chunkContent(long)
+	if len(chunks) < 2 {
+		t.Fatalf("chunkContent(long) = %d chunks, want >1", len(chunks))
+	}
+	for _, c := range chunks {
+		n := len(strings.Fields(c))
+		if n > chunkTargetWords {
+			t.Errorf("chunk has %d words, want <= %d", n, chunkTargetWords)
+		}
+	}
+}
 
 func TestCheckAuth(t *testing.T) {
 	cases := []struct {

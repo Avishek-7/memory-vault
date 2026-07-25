@@ -15,12 +15,18 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 
 	_ "github.com/lib/pq"
 )
 
 const embedDim = 384
+
+// chunkTargetWords/chunkOverlapWords approximate all-minilm's 256-token
+// budget via word count (~0.75 words/token), leaving headroom.
+const chunkTargetWords = 150
+const chunkOverlapWords = 15
 
 var db *sql.DB
 
@@ -50,13 +56,49 @@ func initDB() error {
 	_, err = db.Exec(`
 		CREATE EXTENSION IF NOT EXISTS vector;
 		CREATE TABLE IF NOT EXISTS memories (
-			name       TEXT PRIMARY KEY,
-			content    TEXT NOT NULL,
-			embedding  vector(384) NOT NULL,
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			name        TEXT NOT NULL,
+			chunk_index INT NOT NULL DEFAULT 0,
+			content     TEXT NOT NULL,
+			embedding   vector(384) NOT NULL,
+			updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+			PRIMARY KEY (name, chunk_index)
 		);
+		ALTER TABLE memories ADD COLUMN IF NOT EXISTS chunk_index INT NOT NULL DEFAULT 0;
+		DO $$
+		BEGIN
+			IF (SELECT array_length(conkey, 1) FROM pg_constraint
+				WHERE conrelid = 'memories'::regclass AND contype = 'p') = 1 THEN
+				ALTER TABLE memories DROP CONSTRAINT memories_pkey;
+				ALTER TABLE memories ADD PRIMARY KEY (name, chunk_index);
+			END IF;
+		END $$;
 	`)
 	return err
+}
+
+// chunkContent splits content into overlapping word-based chunks that
+// safely fit all-minilm's 256-token context window. Reassembly (get_memory)
+// simply concatenates chunks back together; the small overlap is kept for
+// embedding quality and is not deduplicated on read.
+func chunkContent(content string) []string {
+	words := strings.Fields(content)
+	if len(words) <= chunkTargetWords {
+		return []string{content}
+	}
+	var chunks []string
+	start := 0
+	for start < len(words) {
+		end := start + chunkTargetWords
+		if end > len(words) {
+			end = len(words)
+		}
+		chunks = append(chunks, strings.Join(words[start:end], " "))
+		if end == len(words) {
+			break
+		}
+		start = end - chunkOverlapWords
+	}
+	return chunks
 }
 
 // embed calls a local Ollama server to turn text into a 384-dim vector.
@@ -134,7 +176,7 @@ type tool struct {
 var tools = []tool{
 	{
 		Name:        "save_memory",
-		Description: "Create or overwrite a memory by name with the given content. Embeds the content via Ollama for later semantic search.",
+		Description: "Create or overwrite a memory by name with the given content. Content is chunked and embedded via Ollama for later semantic search.",
 		InputSchema: schema([]string{"name", "content"}, map[string]string{"name": "string", "content": "string"}),
 	},
 	{
@@ -149,7 +191,7 @@ var tools = []tool{
 	},
 	{
 		Name:        "search_memories",
-		Description: "Semantic search over stored memories using pgvector cosine distance. Returns the closest matches with their content.",
+		Description: "Semantic search over stored memories using pgvector cosine distance. Returns the closest matches with their full content.",
 		InputSchema: schema([]string{"query"}, map[string]string{"query": "string"}),
 	},
 	{
@@ -186,6 +228,34 @@ func internalErr(context string, err error) map[string]interface{} {
 	return errResult("internal error")
 }
 
+// reassemble fetches all chunks for name ordered by chunk_index and joins
+// them back into the original content.
+func reassemble(name string) (string, error) {
+	rows, err := db.Query(`SELECT content FROM memories WHERE name = $1 ORDER BY chunk_index`, name)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var parts []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return "", err
+		}
+		parts = append(parts, c)
+	}
+	return strings.Join(parts, " "), nil
+}
+
+type nameDistance struct {
+	name string
+	dist float64
+}
+
+func sortMatchesByDistance(m []nameDistance) {
+	sort.Slice(m, func(i, j int) bool { return m[i].dist < m[j].dist })
+}
+
 func callTool(name string, args map[string]interface{}) map[string]interface{} {
 	switch name {
 	case "save_memory":
@@ -194,33 +264,47 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		if n == "" || content == "" {
 			return errResult("name and content are required")
 		}
-		vec, err := embed(content)
+		chunks := chunkContent(content)
+		tx, err := db.Begin()
 		if err != nil {
-			return internalErr("save_memory embed", err)
+			return internalErr("save_memory begin", err)
 		}
-		_, err = db.Exec(`
-			INSERT INTO memories (name, content, embedding, updated_at)
-			VALUES ($1, $2, $3::vector, now())
-			ON CONFLICT (name) DO UPDATE SET content = $2, embedding = $3::vector, updated_at = now()
-		`, n, content, vectorLiteral(vec))
-		if err != nil {
-			return internalErr("save_memory insert", err)
+		if _, err := tx.Exec(`DELETE FROM memories WHERE name = $1`, n); err != nil {
+			tx.Rollback()
+			return internalErr("save_memory delete", err)
 		}
-		return textResult(fmt.Sprintf("saved memory %q (%d bytes)", n, len(content)))
+		for i, chunk := range chunks {
+			vec, err := embed(chunk)
+			if err != nil {
+				tx.Rollback()
+				return internalErr("save_memory embed", err)
+			}
+			if _, err := tx.Exec(`
+				INSERT INTO memories (name, chunk_index, content, embedding, updated_at)
+				VALUES ($1, $2, $3, $4::vector, now())
+			`, n, i, chunk, vectorLiteral(vec)); err != nil {
+				tx.Rollback()
+				return internalErr("save_memory insert", err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return internalErr("save_memory commit", err)
+		}
+		return textResult(fmt.Sprintf("saved memory %q (%d bytes, %d chunk(s))", n, len(content), len(chunks)))
 
 	case "get_memory":
 		n, _ := args["name"].(string)
-		var content string
-		err := db.QueryRow(`SELECT content FROM memories WHERE name = $1`, n).Scan(&content)
-		if err == sql.ErrNoRows {
-			return errResult(fmt.Sprintf("memory %q not found", n))
-		} else if err != nil {
+		content, err := reassemble(n)
+		if err != nil {
 			return internalErr("get_memory query", err)
+		}
+		if content == "" {
+			return errResult(fmt.Sprintf("memory %q not found", n))
 		}
 		return textResult(content)
 
 	case "list_memories":
-		rows, err := db.Query(`SELECT name FROM memories ORDER BY name`)
+		rows, err := db.Query(`SELECT DISTINCT name FROM memories ORDER BY name`)
 		if err != nil {
 			return internalErr("list_memories query", err)
 		}
@@ -248,26 +332,37 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			return internalErr("search_memories embed", err)
 		}
 		rows, err := db.Query(`
-			SELECT name, content, embedding <=> $1::vector AS distance
+			SELECT DISTINCT ON (name) name, embedding <=> $1::vector AS distance
 			FROM memories
-			ORDER BY distance ASC
-			LIMIT 5
+			ORDER BY name, distance ASC
 		`, vectorLiteral(vec))
 		if err != nil {
 			return internalErr("search_memories query", err)
 		}
-		defer rows.Close()
-		var out []string
+		var matches []nameDistance
 		for rows.Next() {
-			var n, content string
-			var dist float64
-			if err := rows.Scan(&n, &content, &dist); err != nil {
+			var m nameDistance
+			if err := rows.Scan(&m.name, &m.dist); err != nil {
+				rows.Close()
 				return internalErr("search_memories scan", err)
 			}
-			out = append(out, fmt.Sprintf("%s (distance %.4f): %s", n, dist, content))
+			matches = append(matches, m)
 		}
-		if len(out) == 0 {
+		rows.Close()
+		sortMatchesByDistance(matches)
+		if len(matches) > 5 {
+			matches = matches[:5]
+		}
+		if len(matches) == 0 {
 			return textResult("(no matches)")
+		}
+		var out []string
+		for _, m := range matches {
+			content, err := reassemble(m.name)
+			if err != nil {
+				return internalErr("search_memories reassemble", err)
+			}
+			out = append(out, fmt.Sprintf("%s (distance %.4f): %s", m.name, m.dist, content))
 		}
 		return textResult(strings.Join(out, "\n\n"))
 
@@ -295,7 +390,7 @@ func handle(req request) *response {
 		return resultMsg(req.ID, map[string]interface{}{
 			"protocolVersion": "2024-11-05",
 			"capabilities":    map[string]interface{}{"tools": map[string]interface{}{}},
-			"serverInfo":      map[string]string{"name": "memory-vault", "version": "0.3.0"},
+			"serverInfo":      map[string]string{"name": "memory-vault", "version": "0.4.0"},
 		})
 
 	case "notifications/initialized":

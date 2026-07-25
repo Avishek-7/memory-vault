@@ -98,9 +98,11 @@ cd /home/avishek/Docker && docker compose up -d memory-vault
 (`develop` is where in-progress work lands; merge to `master` once stable
 to trigger the pipeline.)
 
-## Known limitation
+## Chunking
 
-`all-minilm` has a 256-token context window. Content longer than that
-will fail to embed (`save_memory`/`search_memories` return an error from
-Ollama) — keep saved memories short, or chunk longer content before
-saving.
+`all-minilm` has a 256-token context window. `save_memory` automatically
+splits content longer than ~150 words into overlapping chunks (150-word
+target, 15-word overlap), embeds each chunk separately, and stores them
+under the same memory name. `get_memory` and `search_memories` transparently
+reassemble the full content from its chunks, so long memories no longer
+fail to save.
