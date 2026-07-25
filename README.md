@@ -9,11 +9,22 @@ Postgres/pgvector for storage and a local Ollama model (`all-minilm`,
 
 | Tool | Description |
 |---|---|
-| `save_memory` | Create or overwrite a memory by name. Embeds the content for semantic search. |
+| `save_memory` | Create or overwrite a memory by name. Chunks and embeds the content for semantic search. |
 | `get_memory` | Fetch a memory's content by exact name. |
-| `list_memories` | List all stored memory names. |
-| `search_memories` | Semantic search via pgvector cosine distance, top 5 matches. |
+| `list_memories` | List stored memory names. |
+| `search_memories` | Hybrid (semantic + keyword + recency) search, top `limit` matches (default 5, max 20). |
 | `delete_memory` | Delete a memory by name. |
+
+All tools accept an optional `space` argument (default `"default"`) to
+namespace memories — the same `name` can exist independently in different
+spaces. `list_memories` without a `space` lists everything grouped by
+space; with one, it lists just that space's memory names.
+
+## Resources
+
+Every stored memory is also browsable as an MCP resource
+(`resources/list`, `resources/read`), addressed by URI
+`memory://<space>/<name>`, alongside the `tools/call` interface above.
 
 ## Requirements
 
@@ -33,6 +44,13 @@ Environment variables:
 | `PORT` | `8080` | HTTP listen port |
 | `AUTH_TOKEN` | *(none)* | Bearer token(s) required on `/mcp` (comma-separated for multiple clients). If unset, auth is disabled — set this in production. |
 | `ALLOWED_HOSTS` | *(none)* | Comma-separated `Host` header allowlist, guards against DNS-rebinding. If unset, the check is skipped — set this in production. |
+| `DB_MAX_OPEN_CONNS` | `10` | Max open Postgres connections |
+| `DB_MAX_IDLE_CONNS` | `5` | Max idle Postgres connections |
+| `DB_CONN_MAX_LIFETIME_MIN` | `30` | Max connection lifetime, in minutes |
+| `SEARCH_WEIGHT_SEMANTIC` | `1.0` | Weight of pgvector cosine similarity in `search_memories` ranking |
+| `SEARCH_WEIGHT_KEYWORD` | `0.0` | Weight of full-text (`ts_rank`) similarity |
+| `SEARCH_WEIGHT_RECENCY` | `0.0` | Weight of recency (exponential decay by `updated_at`) |
+| `SEARCH_RECENCY_HALFLIFE_DAYS` | `30` | Half-life, in days, for the recency decay factor |
 
 ## Run locally
 
@@ -98,9 +116,11 @@ cd /home/avishek/Docker && docker compose up -d memory-vault
 (`develop` is where in-progress work lands; merge to `master` once stable
 to trigger the pipeline.)
 
-## Known limitation
+## Chunking
 
-`all-minilm` has a 256-token context window. Content longer than that
-will fail to embed (`save_memory`/`search_memories` return an error from
-Ollama) — keep saved memories short, or chunk longer content before
-saving.
+`all-minilm` has a 256-token context window. `save_memory` automatically
+splits content longer than ~150 words into overlapping chunks (150-word
+target, 15-word overlap), embeds each chunk separately, and stores them
+under the same memory name. `get_memory` and `search_memories` transparently
+reassemble the full content from its chunks, so long memories no longer
+fail to save.
