@@ -33,6 +33,9 @@ Environment variables:
 | `PORT` | `8080` | HTTP listen port |
 | `AUTH_TOKEN` | *(none)* | Bearer token(s) required on `/mcp` (comma-separated for multiple clients). If unset, auth is disabled — set this in production. |
 | `ALLOWED_HOSTS` | *(none)* | Comma-separated `Host` header allowlist, guards against DNS-rebinding. If unset, the check is skipped — set this in production. |
+| `DB_MAX_OPEN_CONNS` | `10` | Max open Postgres connections |
+| `DB_MAX_IDLE_CONNS` | `5` | Max idle Postgres connections |
+| `DB_CONN_MAX_LIFETIME_MIN` | `30` | Max connection lifetime, in minutes |
 
 ## Run locally
 

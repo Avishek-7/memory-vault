@@ -16,7 +16,9 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	_ "github.com/lib/pq"
 )
@@ -37,6 +39,15 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+func envOrInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
 func ollamaURL() string   { return envOr("OLLAMA_URL", "http://localhost:11434") }
 func ollamaModel() string { return envOr("OLLAMA_EMBED_MODEL", "all-minilm") }
 
@@ -53,6 +64,9 @@ func initDB() error {
 	if err := db.Ping(); err != nil {
 		return err
 	}
+	db.SetMaxOpenConns(envOrInt("DB_MAX_OPEN_CONNS", 10))
+	db.SetMaxIdleConns(envOrInt("DB_MAX_IDLE_CONNS", 5))
+	db.SetConnMaxLifetime(time.Duration(envOrInt("DB_CONN_MAX_LIFETIME_MIN", 30)) * time.Minute)
 	_, err = db.Exec(`
 		CREATE EXTENSION IF NOT EXISTS vector;
 		CREATE TABLE IF NOT EXISTS memories (
@@ -72,6 +86,8 @@ func initDB() error {
 				ALTER TABLE memories ADD PRIMARY KEY (name, chunk_index);
 			END IF;
 		END $$;
+		CREATE INDEX IF NOT EXISTS memories_embedding_idx
+			ON memories USING hnsw (embedding vector_cosine_ops);
 	`)
 	return err
 }
