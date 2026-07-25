@@ -185,3 +185,40 @@ func TestIntegrationResources(t *testing.T) {
 		t.Errorf("readResource text = %q, want %q", text, "resource content")
 	}
 }
+
+func TestIntegrationExportImportRoundTrip(t *testing.T) {
+	setupIntegrationDB(t)
+	callTool("save_memory", map[string]interface{}{"name": "note-a", "content": "alpha content", "space": "export-src"})
+	callTool("save_memory", map[string]interface{}{"name": "note-b", "content": "beta content", "space": "export-src"})
+	defer callTool("delete_memory", map[string]interface{}{"name": "note-a", "space": "export-src"})
+	defer callTool("delete_memory", map[string]interface{}{"name": "note-b", "space": "export-src"})
+	defer callTool("delete_memory", map[string]interface{}{"name": "note-a", "space": "export-dst"})
+	defer callTool("delete_memory", map[string]interface{}{"name": "note-b", "space": "export-dst"})
+
+	exported := callTool("export_memories", map[string]interface{}{"space": "export-src"})
+	if exported["isError"] == true {
+		t.Fatalf("export_memories failed: %v", exported)
+	}
+	payload := exported["content"].([]map[string]string)[0]["text"]
+
+	imported := callTool("import_memories", map[string]interface{}{"data": payload, "space": "export-dst"})
+	if imported["isError"] == true {
+		t.Fatalf("import_memories failed: %v", imported)
+	}
+
+	got := callTool("get_memory", map[string]interface{}{"name": "note-a", "space": "export-dst"})
+	text2 := got["content"].([]map[string]string)[0]["text"]
+	if text2 != "alpha content" {
+		t.Errorf("get_memory after import = %q, want %q", text2, "alpha content")
+	}
+
+	// re-importing without overwrite should skip both, since they now exist.
+	imported2 := callTool("import_memories", map[string]interface{}{"data": payload, "space": "export-dst"})
+	if imported2["isError"] == true {
+		t.Fatalf("second import_memories failed: %v", imported2)
+	}
+	summary := imported2["content"].([]map[string]string)[0]["text"]
+	if !strings.Contains(summary, "skipped 2") {
+		t.Errorf("second import summary = %q, want it to report 2 skipped", summary)
+	}
+}

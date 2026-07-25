@@ -83,6 +83,8 @@ client at `http://localhost:8080/mcp` (see
 | `search_memories` | Hybrid (semantic + keyword + recency) search, top `limit` matches (default 5, max 20). |
 | `delete_memory` | Delete a memory by name. |
 | `compact_memories` | Merge/summarize near-duplicate or stale memories via the local Ollama chat model. |
+| `export_memories` | Export memories as JSON (no embeddings). Optional `space`; omit it to export everything. |
+| `import_memories` | Import memories from JSON in the shape `export_memories` produces. Re-chunks/re-embeds through the normal save path. |
 
 All tools accept an optional `space` argument (default `"default"`) to
 namespace memories — the same `name` can exist independently in different
@@ -108,6 +110,35 @@ without writing anything, or `dry_run: false` to actually merge. It's
 manual/on-demand — there's no background cron. If you want it to run
 automatically, wire a periodic call to the tool into a cron job or an
 n8n/similar workflow.
+
+## Export / import
+
+`export_memories` returns a JSON array of `{name, space, content,
+updated_at}` — no embeddings, since they're cheap to regenerate on import
+and including them would tie the export to whatever embedding
+model/dimension was active when it was taken. `import_memories` takes
+that same JSON (as its `data` argument) and re-chunks/re-embeds every
+memory through the normal save path, so it's applied consistently with
+whatever `Embedder` is currently configured. By default it skips
+`(space, name)` pairs that already exist and reports which ones it
+skipped; pass `overwrite: true` to replace them instead. An optional
+`space` argument sends every imported memory there regardless of what's
+recorded in the data — useful for merging a backup into a differently
+named space.
+
+Both are also available as CLI subcommands on the `memory-vault` binary
+itself, for scripting a backup without going through an MCP client:
+
+```
+memory-vault export --space default > backup.json
+memory-vault import --file backup.json
+# or: cat backup.json | memory-vault import
+```
+
+`export`/`import` need the same `DATABASE_URL` (and `OLLAMA_URL` or
+`EMBED_PROVIDER=openai` config, for `import`'s re-embedding) as the
+server itself. `import --space other-space --overwrite` mirrors the
+tool's `space`/`overwrite` arguments.
 
 ## Browsing memories
 

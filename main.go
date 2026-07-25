@@ -10,7 +10,9 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -202,6 +204,16 @@ var tools = []tool{
 		Name:        "compact_memories",
 		Description: "Find near-duplicate or stale memories (within a space, or all spaces if omitted) and merge/summarize them via the local Ollama chat model. dry_run (default true) returns the proposed plan without writing anything.",
 		InputSchema: schema(nil, map[string]string{"space": "string", "dry_run": "boolean"}),
+	},
+	{
+		Name:        "export_memories",
+		Description: "Export memories as JSON (name, space, content, updated_at — no embeddings, which are cheap to regenerate on import). Optional space exports just that space; omit it to export everything.",
+		InputSchema: schema(nil, map[string]string{"space": "string"}),
+	},
+	{
+		Name:        "import_memories",
+		Description: "Import memories from a JSON payload in the shape export_memories produces. Re-chunks and re-embeds every memory through the normal save path. Optional space sends every imported memory there regardless of what's in the data (useful for merging a backup into a differently-named space); optional overwrite (default false) controls whether memories that already exist are replaced or skipped.",
+		InputSchema: schema([]string{"data"}, map[string]string{"data": "string", "space": "string", "overwrite": "boolean"}),
 	},
 }
 
@@ -486,6 +498,39 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		}
 		return textResult(fmt.Sprintf("%s %d group(s):\n%s", verb, len(lines), strings.Join(lines, "\n")))
 
+	case "export_memories":
+		space, _ := args["space"].(string)
+		items, err := st.Export(space)
+		if err != nil {
+			return internalErr("export_memories", err)
+		}
+		payload, err := json.MarshalIndent(items, "", "  ")
+		if err != nil {
+			return internalErr("export_memories marshal", err)
+		}
+		return textResult(string(payload))
+
+	case "import_memories":
+		raw, _ := args["data"].(string)
+		if raw == "" {
+			return errResult("data is required")
+		}
+		var items []store.MemoryExport
+		if err := json.Unmarshal([]byte(raw), &items); err != nil {
+			return errResult("data is not valid export JSON: " + err.Error())
+		}
+		spaceOverride, _ := args["space"].(string)
+		overwrite, _ := args["overwrite"].(bool)
+		res, err := st.Import(items, spaceOverride, overwrite)
+		if err != nil {
+			return internalErr("import_memories", err)
+		}
+		summary := fmt.Sprintf("imported %d, skipped %d", len(res.Imported), len(res.Skipped))
+		if len(res.Skipped) > 0 {
+			summary += fmt.Sprintf("\nskipped (already exist, overwrite=false): %s", strings.Join(res.Skipped, ", "))
+		}
+		return textResult(summary)
+
 	default:
 		return errResult(fmt.Sprintf("unknown tool %q", name))
 	}
@@ -706,6 +751,54 @@ func mcpHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// runExportCLI backs `memory-vault export`, a non-MCP way to back up the
+// vault (or one space of it) without going through an MCP client.
+func runExportCLI(args []string) {
+	fs := flag.NewFlagSet("export", flag.ExitOnError)
+	space := fs.String("space", "", "space to export (all spaces if omitted)")
+	fs.Parse(args)
+
+	items, err := st.Export(*space)
+	if err != nil {
+		log.Fatalf("export: %v", err)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(items); err != nil {
+		log.Fatalf("export: %v", err)
+	}
+}
+
+// runImportCLI backs `memory-vault import`, the counterpart to
+// runExportCLI. Reads stdin unless -file is given.
+func runImportCLI(args []string) {
+	fs := flag.NewFlagSet("import", flag.ExitOnError)
+	file := fs.String("file", "", "JSON file to import (reads stdin if omitted)")
+	space := fs.String("space", "", "send every imported memory to this space, overriding what's in the data")
+	overwrite := fs.Bool("overwrite", false, "overwrite existing (space, name) pairs instead of skipping them")
+	fs.Parse(args)
+
+	var r io.Reader = os.Stdin
+	if *file != "" {
+		f, err := os.Open(*file)
+		if err != nil {
+			log.Fatalf("import: %v", err)
+		}
+		defer f.Close()
+		r = f
+	}
+	var items []store.MemoryExport
+	if err := json.NewDecoder(r).Decode(&items); err != nil {
+		log.Fatalf("import: invalid JSON: %v", err)
+	}
+	res, err := st.Import(items, *space, *overwrite)
+	if err != nil {
+		log.Fatalf("import: %v", err)
+	}
+	fmt.Printf("imported %d, skipped %d\n", len(res.Imported), len(res.Skipped))
+	if len(res.Skipped) > 0 {
+		fmt.Printf("skipped (already exist, overwrite=false): %s\n", strings.Join(res.Skipped, ", "))
+	}
+}
+
 func main() {
 	var err error
 	st, err = store.Open(storeConfig())
@@ -713,6 +806,17 @@ func main() {
 		log.Fatalf("db init failed: %v", err)
 	}
 	defer st.Close()
+
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "export":
+			runExportCLI(os.Args[2:])
+			return
+		case "import":
+			runImportCLI(os.Args[2:])
+			return
+		}
+	}
 
 	addr := ":" + envOr("PORT", "8080")
 	http.HandleFunc("/mcp", mcpHandler)

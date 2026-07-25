@@ -434,3 +434,88 @@ func (s *Store) MemoryCentroids(space string) ([]MemoryCentroid, error) {
 	}
 	return out, rows.Err()
 }
+
+// MemoryExport is one memory's portable representation: no embeddings
+// (cheap to regenerate on Import, and including them would tie the
+// export to a specific embedding model/dimension).
+type MemoryExport struct {
+	Name      string    `json:"name"`
+	Space     string    `json:"space"`
+	Content   string    `json:"content"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Export reassembles every memory in space into its portable form,
+// ordered by space then name. Exports every space if space == "".
+func (s *Store) Export(space string) ([]MemoryExport, error) {
+	query := `SELECT space, name, content, updated_at FROM memories`
+	var args []interface{}
+	if space != "" {
+		query += ` WHERE space = $1`
+		args = append(args, space)
+	}
+	query += ` ORDER BY space, name, chunk_index`
+	rows, err := s.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []MemoryExport
+	for rows.Next() {
+		var sp, name, content string
+		var updatedAt time.Time
+		if err := rows.Scan(&sp, &name, &content, &updatedAt); err != nil {
+			return nil, err
+		}
+		if n := len(out); n > 0 && out[n-1].Space == sp && out[n-1].Name == name {
+			out[n-1].Content += " " + content // rejoin chunks, same as Reassemble
+		} else {
+			out = append(out, MemoryExport{Space: sp, Name: name, Content: content, UpdatedAt: updatedAt})
+		}
+	}
+	return out, rows.Err()
+}
+
+// ImportResult reports what Import did with each memory in the payload:
+// which were written, and which were skipped because they already
+// existed and overwrite was false.
+type ImportResult struct {
+	Imported []string // "space/name"
+	Skipped  []string // "space/name"
+}
+
+// Import re-chunks and re-embeds every memory in data through SaveMemory
+// (the normal save path), so chunking and whichever Embedder is
+// currently configured are applied consistently rather than writing rows
+// directly. spaceOverride, if non-empty, sends every memory to that
+// space regardless of what's recorded in data; otherwise each memory
+// keeps its own recorded space. A (space, name) pair that already exists
+// is skipped unless overwrite is true.
+func (s *Store) Import(data []MemoryExport, spaceOverride string, overwrite bool) (ImportResult, error) {
+	var res ImportResult
+	for _, m := range data {
+		space := m.Space
+		if spaceOverride != "" {
+			space = spaceOverride
+		}
+		if space == "" {
+			space = DefaultSpace
+		}
+		if !overwrite {
+			existing, err := s.Reassemble(space, m.Name)
+			if err != nil {
+				return res, err
+			}
+			if existing != "" {
+				res.Skipped = append(res.Skipped, space+"/"+m.Name)
+				continue
+			}
+		}
+		if _, err := s.SaveMemory(space, m.Name, m.Content); err != nil {
+			return res, err
+		}
+		res.Imported = append(res.Imported, space+"/"+m.Name)
+	}
+	return res, nil
+}
