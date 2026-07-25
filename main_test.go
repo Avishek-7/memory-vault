@@ -106,16 +106,31 @@ func TestParseResourceURI(t *testing.T) {
 	}
 }
 
-// setupIntegrationDB skips the test unless DATABASE_URL and OLLAMA_URL are
-// set, since these tests exercise real chunking/embedding/search round
-// trips against a live Postgres+pgvector and Ollama instance.
+// setupIntegrationDB skips the test unless DATABASE_URL and (depending on
+// EMBED_PROVIDER) the configured embedding backend are set, since these
+// tests exercise real chunking/embedding/search round trips against a
+// live Postgres+pgvector and either Ollama or an OpenAI-compatible
+// endpoint.
 func setupIntegrationDB(t *testing.T) {
 	t.Helper()
-	if os.Getenv("DATABASE_URL") == "" || os.Getenv("OLLAMA_URL") == "" {
-		t.Skip("DATABASE_URL/OLLAMA_URL not set, skipping integration test")
+	if os.Getenv("DATABASE_URL") == "" {
+		t.Skip("DATABASE_URL not set, skipping integration test")
 	}
-	var err error
-	st, err = store.Open(storeConfig())
+	switch envOr("EMBED_PROVIDER", "ollama") {
+	case "openai":
+		if os.Getenv("OPENAI_EMBED_API_KEY") == "" {
+			t.Skip("EMBED_PROVIDER=openai but OPENAI_EMBED_API_KEY not set, skipping integration test")
+		}
+	default:
+		if os.Getenv("OLLAMA_URL") == "" {
+			t.Skip("OLLAMA_URL not set, skipping integration test")
+		}
+	}
+	cfg, err := storeConfig()
+	if err != nil {
+		t.Fatalf("storeConfig: %v", err)
+	}
+	st, err = store.Open(cfg)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -183,5 +198,42 @@ func TestIntegrationResources(t *testing.T) {
 	text := read.(map[string]interface{})["contents"].([]map[string]string)[0]["text"]
 	if text != "resource content" {
 		t.Errorf("readResource text = %q, want %q", text, "resource content")
+	}
+}
+
+// mustText fails the test immediately with the full tool result if res is
+// an error, then returns its text content — so a failed save/get/export/
+// import surfaces as a clear message instead of a type-assertion panic.
+func mustText(t *testing.T, tool string, res map[string]interface{}) string {
+	t.Helper()
+	if res["isError"] == true {
+		t.Fatalf("%s failed: %v", tool, res)
+	}
+	return res["content"].([]map[string]string)[0]["text"]
+}
+
+func TestIntegrationExportImportRoundTrip(t *testing.T) {
+	setupIntegrationDB(t)
+	mustText(t, "save_memory", callTool("save_memory", map[string]interface{}{"name": "note-a", "content": "alpha content", "space": "export-src"}))
+	mustText(t, "save_memory", callTool("save_memory", map[string]interface{}{"name": "note-b", "content": "beta content", "space": "export-src"}))
+	defer callTool("delete_memory", map[string]interface{}{"name": "note-a", "space": "export-src"})
+	defer callTool("delete_memory", map[string]interface{}{"name": "note-b", "space": "export-src"})
+	defer callTool("delete_memory", map[string]interface{}{"name": "note-a", "space": "export-dst"})
+	defer callTool("delete_memory", map[string]interface{}{"name": "note-b", "space": "export-dst"})
+
+	payload := mustText(t, "export_memories", callTool("export_memories", map[string]interface{}{"space": "export-src"}))
+	mustText(t, "import_memories", callTool("import_memories", map[string]interface{}{"data": payload, "space": "export-dst"}))
+
+	if got := mustText(t, "get_memory", callTool("get_memory", map[string]interface{}{"name": "note-a", "space": "export-dst"})); got != "alpha content" {
+		t.Errorf("get_memory(note-a) after import = %q, want %q", got, "alpha content")
+	}
+	if got := mustText(t, "get_memory", callTool("get_memory", map[string]interface{}{"name": "note-b", "space": "export-dst"})); got != "beta content" {
+		t.Errorf("get_memory(note-b) after import = %q, want %q", got, "beta content")
+	}
+
+	// re-importing without overwrite should skip both, since they now exist.
+	summary := mustText(t, "import_memories", callTool("import_memories", map[string]interface{}{"data": payload, "space": "export-dst"}))
+	if !strings.Contains(summary, "skipped 2") {
+		t.Errorf("second import summary = %q, want it to report 2 skipped", summary)
 	}
 }

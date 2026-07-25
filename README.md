@@ -1,9 +1,77 @@
 # memory-vault
 
-A minimal MCP server exposing persistent memory tools to LLMs, backed by
-Postgres/pgvector for storage and a local Ollama model (`all-minilm`,
-384-dim) for embeddings. Talks the MCP Streamable HTTP transport
-(`POST /mcp`).
+[![CI](https://github.com/Avishek-7/memory-vault/actions/workflows/ci.yml/badge.svg)](https://github.com/Avishek-7/memory-vault/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/github/license/Avishek-7/memory-vault)](LICENSE)
+[![Go 1.26](https://img.shields.io/badge/go-1.26-00ADD8?logo=go&logoColor=white)](go.mod)
+
+An MCP server that gives LLMs persistent, searchable memory, backed by
+Postgres/pgvector and a local Ollama model for embeddings. It ships as a
+single static Go binary — no Python runtime, no Node, no separate vector
+DB service beyond Postgres. Everything that touches a model (embeddings
+for search/save, summarization for compaction) calls a local Ollama
+server; nothing here calls an external LLM API unless you opt into one
+(see [Using a different embedding backend](#using-a-different-embedding-backend)).
+Memories don't just accumulate — `compact_memories` finds near-duplicate
+or stale entries and merges them, on demand. There's also a terminal UI
+(`memory-vault-tui`) for browsing, searching, editing, and deleting
+memories directly, without going through an MCP client. Talks the MCP
+Streamable HTTP transport (`POST /mcp`) and exposes both `tools/*` and
+`resources/*`.
+
+## Why this instead of X
+
+There are more mature, more featureful memory layers out there — this is
+a smaller, simpler tool that trades breadth for being self-contained and
+easy to run yourself. Fair comparison, not a sales pitch:
+
+| | memory-vault | [mem0](https://github.com/mem0ai/mem0) | [Zep](https://www.getzep.com/) |
+|---|---|---|---|
+| Runtime | Single static Go binary | Python/TS library or self-hosted server | Managed platform (Python service); self-hosted Community Edition retired in 2025 |
+| Fully local, no external API key required | Yes — Ollama only | Yes, if self-hosted against a local Ollama + local vector store | No — cloud/managed by default; full self-host no longer offered |
+| Vector backend | Postgres/pgvector only | Many: Qdrant, Chroma, Weaviate, Milvus, pgvector, Redis, and more | Proprietary temporal graph engine (Graphiti, open source on its own) |
+| Memory model | Flat text memories, namespaced by space | LLM-extracted facts/entities with automatic dedup on write | Temporal knowledge graph (tracks how facts change over time) |
+| Prunes/compacts memories | Yes — explicit `compact_memories` tool, on demand | Partial — fact-level dedup happens automatically as memories are written | Not really — the graph grows and versions facts over time instead of merging them |
+| Terminal UI | Yes | No | No |
+| License | MIT | Apache-2.0 | Apache-2.0 (Graphiti only; Zep itself is commercial) |
+
+If you need multiple vector backends, framework integrations (LangChain,
+CrewAI, etc.), or entity/relationship-level temporal reasoning, mem0 or
+Zep/Graphiti are more capable choices. memory-vault is for when you want
+something small enough to read in one sitting, running entirely on
+hardware you control.
+
+## Tradeoffs / not a fit if...
+
+- **Single-node Postgres.** There's no built-in replication, sharding,
+  or HA — if you need that, you're running your own Postgres cluster in
+  front of this.
+- **No multi-tenant auth.** `AUTH_TOKEN` is a shared bearer token (or a
+  comma-separated list of them) checked with a constant-time compare —
+  there's no per-user identity, ACLs, or RBAC. Spaces namespace
+  memories, but anyone with a valid token can read/write any space.
+- **No entity or relationship modeling.** Memories are chunked text with
+  embeddings, not a knowledge graph — there's no notion of "this fact
+  superseded that one" beyond what `compact_memories` merges.
+- **Compaction is manual.** `compact_memories` doesn't run on a
+  schedule; you call it (or wire it into your own cron/workflow).
+- **Small, single-maintainer project.** It hasn't been run at the scale
+  or under the scrutiny mem0/Zep have — read the code before trusting it
+  with anything sensitive.
+
+## Quickstart
+
+```
+docker compose up
+```
+
+That builds `memory-vault` and brings up Postgres/pgvector and Ollama
+alongside it, pulling the embedding and chat models on first run (a few
+minutes — Ollama has no models pre-pulled). Once it's up, point an MCP
+client at `http://localhost:8080/mcp` (see
+[Connecting an MCP client](#connecting-an-mcp-client) below). Copy
+`.env.example` to `.env` first if you want to set `AUTH_TOKEN`,
+`ALLOWED_HOSTS`, or different Ollama models — otherwise the defaults
+(no auth, `all-minilm` / `llama3.1:8b`) apply.
 
 ## Tools
 
@@ -15,6 +83,8 @@ Postgres/pgvector for storage and a local Ollama model (`all-minilm`,
 | `search_memories` | Hybrid (semantic + keyword + recency) search, top `limit` matches (default 5, max 20). |
 | `delete_memory` | Delete a memory by name. |
 | `compact_memories` | Merge/summarize near-duplicate or stale memories via the local Ollama chat model. |
+| `export_memories` | Export memories as JSON (no embeddings). Optional `space`; omit it to export everything. |
+| `import_memories` | Import memories from JSON in the shape `export_memories` produces. Re-chunks/re-embeds through the normal save path. |
 
 All tools accept an optional `space` argument (default `"default"`) to
 namespace memories — the same `name` can exist independently in different
@@ -40,6 +110,35 @@ without writing anything, or `dry_run: false` to actually merge. It's
 manual/on-demand — there's no background cron. If you want it to run
 automatically, wire a periodic call to the tool into a cron job or an
 n8n/similar workflow.
+
+## Export / import
+
+`export_memories` returns a JSON array of `{name, space, content,
+updated_at}` — no embeddings, since they're cheap to regenerate on import
+and including them would tie the export to whatever embedding
+model/dimension was active when it was taken. `import_memories` takes
+that same JSON (as its `data` argument) and re-chunks/re-embeds every
+memory through the normal save path, so it's applied consistently with
+whatever `Embedder` is currently configured. By default it skips
+`(space, name)` pairs that already exist and reports which ones it
+skipped; pass `overwrite: true` to replace them instead. An optional
+`space` argument sends every imported memory there regardless of what's
+recorded in the data — useful for merging a backup into a differently
+named space.
+
+Both are also available as CLI subcommands on the `memory-vault` binary
+itself, for scripting a backup without going through an MCP client:
+
+```
+memory-vault export --space default > backup.json
+memory-vault import --file backup.json
+# or: cat backup.json | memory-vault import
+```
+
+`export`/`import` need the same `DATABASE_URL` (and `OLLAMA_URL` or
+`EMBED_PROVIDER=openai` config, for `import`'s re-embedding) as the
+server itself. `import --space other-space --overwrite` mirrors the
+tool's `space`/`overwrite` arguments.
 
 ## Browsing memories
 
@@ -93,7 +192,13 @@ Environment variables:
 | `OLLAMA_URL` | `http://localhost:11434` | Base URL of the Ollama server |
 | `OLLAMA_EMBED_MODEL` | `all-minilm` | Ollama embedding model name |
 | `OLLAMA_CHAT_MODEL` | `llama3.1:8b` | Ollama chat model used only by `compact_memories` |
+| `EMBED_PROVIDER` | `ollama` | Embedding backend: `ollama` (default) or `openai` — see [Using a different embedding backend](#using-a-different-embedding-backend) |
+| `EMBED_DIM` | `384` | Dimension of the configured embedder's vectors; baked into the `embedding` column at table-creation time |
+| `OPENAI_EMBED_BASE_URL` | `https://api.openai.com/v1` | Base URL for an OpenAI-compatible embeddings endpoint; only used when `EMBED_PROVIDER=openai` |
+| `OPENAI_EMBED_API_KEY` | *(none)* | API key for the OpenAI-compatible endpoint; only used when `EMBED_PROVIDER=openai` |
+| `OPENAI_EMBED_MODEL` | `text-embedding-3-small` | Model name for the OpenAI-compatible endpoint; only used when `EMBED_PROVIDER=openai` |
 | `PORT` | `8080` | HTTP listen port |
+| `MAX_REQUEST_BODY_MB` | `25` | Max `/mcp` request body size, in MB — guards against unbounded-memory requests (e.g. an oversized `import_memories` payload) |
 | `AUTH_TOKEN` | *(none)* | Bearer token(s) required on `/mcp` (comma-separated for multiple clients). If unset, auth is disabled — set this in production. |
 | `ALLOWED_HOSTS` | *(none)* | Comma-separated `Host` header allowlist, guards against DNS-rebinding. If unset, the check is skipped — set this in production. |
 | `DB_MAX_OPEN_CONNS` | `10` | Max open Postgres connections |
@@ -105,6 +210,30 @@ Environment variables:
 | `SEARCH_RECENCY_HALFLIFE_DAYS` | `30` | Half-life, in days, for the recency decay factor |
 | `COMPACT_SIMILARITY_THRESHOLD` | `0.15` | Cosine-distance threshold under which two memories' embeddings are treated as near-duplicates by `compact_memories` |
 | `COMPACT_STALE_DAYS` | `90` | Age (in days since `updated_at`) past which a lone memory is still a `compact_memories` candidate for solo re-summarization |
+
+## Using a different embedding backend
+
+The local-first default (Ollama, `all-minilm`, 384-dim) is intentional —
+it's the whole point of this project — not a placeholder waiting for you
+to switch to a hosted API. But if you'd rather point at an
+OpenAI-compatible embeddings endpoint (OpenAI itself, or a self-hosted
+OpenAI-compatible server like LiteLLM or text-embeddings-inference), set:
+
+```
+EMBED_PROVIDER=openai
+OPENAI_EMBED_BASE_URL=https://api.openai.com/v1
+OPENAI_EMBED_API_KEY=sk-...
+OPENAI_EMBED_MODEL=text-embedding-3-small
+EMBED_DIM=1536
+```
+
+`EMBED_DIM` must match whatever the configured model actually returns —
+it's checked on every embed call, and gets baked into the Postgres
+`vector` column when the table is first created. Switching `EMBED_DIM`
+or embedding models on an existing database won't retroactively
+re-embed anything or resize the column; start from a fresh database (or
+`export_memories`/`import_memories` — see below — into a new one) if you
+change backends after memories already exist.
 
 ## Run locally
 
