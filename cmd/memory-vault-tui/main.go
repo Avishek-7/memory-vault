@@ -38,32 +38,39 @@ func envOrInt(key string, fallback int) int {
 
 // embedderFromEnv mirrors main.go's EMBED_PROVIDER handling, so the TUI
 // reads/writes memories with whichever embedding backend the MCP server
-// is configured to use.
-func embedderFromEnv() embed.Embedder {
-	switch envOr("EMBED_PROVIDER", "ollama") {
+// is configured to use. Any value other than "ollama"/"openai" is a
+// configuration error, not a silent fallback to Ollama.
+func embedderFromEnv() (embed.Embedder, error) {
+	switch provider := envOr("EMBED_PROVIDER", "ollama"); provider {
+	case "ollama":
+		return &embed.OllamaEmbedder{
+			URL:   envOr("OLLAMA_URL", "http://localhost:11434"),
+			Model: envOr("OLLAMA_EMBED_MODEL", "all-minilm"),
+		}, nil
 	case "openai":
 		return &embed.OpenAIEmbedder{
 			BaseURL: envOr("OPENAI_EMBED_BASE_URL", "https://api.openai.com/v1"),
 			APIKey:  os.Getenv("OPENAI_EMBED_API_KEY"),
 			Model:   envOr("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
-		}
+		}, nil
 	default:
-		return &embed.OllamaEmbedder{
-			URL:   envOr("OLLAMA_URL", "http://localhost:11434"),
-			Model: envOr("OLLAMA_EMBED_MODEL", "all-minilm"),
-		}
+		return nil, fmt.Errorf("unrecognized EMBED_PROVIDER %q (want \"ollama\" or \"openai\")", provider)
 	}
 }
 
-func storeConfig() store.Config {
+func storeConfig() (store.Config, error) {
+	embedder, err := embedderFromEnv()
+	if err != nil {
+		return store.Config{}, err
+	}
 	return store.Config{
 		DatabaseURL:     os.Getenv("DATABASE_URL"),
-		Embedder:        embedderFromEnv(),
+		Embedder:        embedder,
 		EmbedDim:        envOrInt("EMBED_DIM", store.DefaultEmbedDim),
 		MaxOpenConns:    5,
 		MaxIdleConns:    2,
 		ConnMaxLifetime: 30 * time.Minute,
-	}
+	}, nil
 }
 
 func editor() string { return envOr("EDITOR", "nvim") }
@@ -518,7 +525,12 @@ func (m model) View() string {
 }
 
 func main() {
-	st, err := store.Open(storeConfig())
+	cfg, err := storeConfig()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config error:", err)
+		os.Exit(1)
+	}
+	st, err := store.Open(cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "store.Open:", err)
 		os.Exit(1)

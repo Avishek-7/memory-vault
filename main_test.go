@@ -106,16 +106,31 @@ func TestParseResourceURI(t *testing.T) {
 	}
 }
 
-// setupIntegrationDB skips the test unless DATABASE_URL and OLLAMA_URL are
-// set, since these tests exercise real chunking/embedding/search round
-// trips against a live Postgres+pgvector and Ollama instance.
+// setupIntegrationDB skips the test unless DATABASE_URL and (depending on
+// EMBED_PROVIDER) the configured embedding backend are set, since these
+// tests exercise real chunking/embedding/search round trips against a
+// live Postgres+pgvector and either Ollama or an OpenAI-compatible
+// endpoint.
 func setupIntegrationDB(t *testing.T) {
 	t.Helper()
-	if os.Getenv("DATABASE_URL") == "" || os.Getenv("OLLAMA_URL") == "" {
-		t.Skip("DATABASE_URL/OLLAMA_URL not set, skipping integration test")
+	if os.Getenv("DATABASE_URL") == "" {
+		t.Skip("DATABASE_URL not set, skipping integration test")
 	}
-	var err error
-	st, err = store.Open(storeConfig())
+	switch envOr("EMBED_PROVIDER", "ollama") {
+	case "openai":
+		if os.Getenv("OPENAI_EMBED_API_KEY") == "" {
+			t.Skip("EMBED_PROVIDER=openai but OPENAI_EMBED_API_KEY not set, skipping integration test")
+		}
+	default:
+		if os.Getenv("OLLAMA_URL") == "" {
+			t.Skip("OLLAMA_URL not set, skipping integration test")
+		}
+	}
+	cfg, err := storeConfig()
+	if err != nil {
+		t.Fatalf("storeConfig: %v", err)
+	}
+	st, err = store.Open(cfg)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}

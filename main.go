@@ -74,29 +74,36 @@ func compactionSettings() (similarityThreshold float64, staleDays int) {
 // today's only behavior). "openai" is an escape hatch for an
 // OpenAI-compatible embeddings endpoint (OpenAI itself, or a self-hosted
 // server like LiteLLM/text-embeddings-inference) — not a recommendation
-// to move off the local-first default.
-func embedderFromEnv() embed.Embedder {
-	switch envOr("EMBED_PROVIDER", "ollama") {
+// to move off the local-first default. Any other value is a configuration
+// error (most likely a typo) rather than a silent fallback to Ollama.
+func embedderFromEnv() (embed.Embedder, error) {
+	switch provider := envOr("EMBED_PROVIDER", "ollama"); provider {
+	case "ollama":
+		return &embed.OllamaEmbedder{URL: ollamaURL(), Model: ollamaModel()}, nil
 	case "openai":
 		return &embed.OpenAIEmbedder{
 			BaseURL: envOr("OPENAI_EMBED_BASE_URL", "https://api.openai.com/v1"),
 			APIKey:  os.Getenv("OPENAI_EMBED_API_KEY"),
 			Model:   envOr("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
-		}
+		}, nil
 	default:
-		return &embed.OllamaEmbedder{URL: ollamaURL(), Model: ollamaModel()}
+		return nil, fmt.Errorf("unrecognized EMBED_PROVIDER %q (want \"ollama\" or \"openai\")", provider)
 	}
 }
 
-func storeConfig() store.Config {
+func storeConfig() (store.Config, error) {
+	embedder, err := embedderFromEnv()
+	if err != nil {
+		return store.Config{}, err
+	}
 	return store.Config{
 		DatabaseURL:     os.Getenv("DATABASE_URL"),
-		Embedder:        embedderFromEnv(),
+		Embedder:        embedder,
 		EmbedDim:        envOrInt("EMBED_DIM", store.DefaultEmbedDim),
 		MaxOpenConns:    envOrInt("DB_MAX_OPEN_CONNS", 10),
 		MaxIdleConns:    envOrInt("DB_MAX_IDLE_CONNS", 5),
 		ConnMaxLifetime: time.Duration(envOrInt("DB_CONN_MAX_LIFETIME_MIN", 30)) * time.Minute,
-	}
+	}, nil
 }
 
 // search scoring weights: default to semantic-only ranking (identical to
@@ -809,8 +816,11 @@ func runImportCLI(args []string) {
 }
 
 func main() {
-	var err error
-	st, err = store.Open(storeConfig())
+	cfg, err := storeConfig()
+	if err != nil {
+		log.Fatalf("config error: %v", err)
+	}
+	st, err = store.Open(cfg)
 	if err != nil {
 		log.Fatalf("db init failed: %v", err)
 	}
