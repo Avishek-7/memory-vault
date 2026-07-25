@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -43,6 +44,15 @@ func envOrInt(key string, fallback int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return fallback
+}
+
+func envOrFloat(key string, fallback float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return fallback
@@ -90,8 +100,20 @@ func initDB() error {
 		END $$;
 		CREATE INDEX IF NOT EXISTS memories_embedding_idx
 			ON memories USING hnsw (embedding vector_cosine_ops);
+		ALTER TABLE memories ADD COLUMN IF NOT EXISTS content_tsv tsvector
+			GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
+		CREATE INDEX IF NOT EXISTS memories_content_tsv_idx ON memories USING GIN (content_tsv);
 	`)
 	return err
+}
+
+// search scoring weights: default to semantic-only ranking (identical to
+// pre-hybrid-search behavior) unless overridden.
+func searchWeights() (semantic, keyword, recency, halfLifeDays float64) {
+	return envOrFloat("SEARCH_WEIGHT_SEMANTIC", 1.0),
+		envOrFloat("SEARCH_WEIGHT_KEYWORD", 0.0),
+		envOrFloat("SEARCH_WEIGHT_RECENCY", 0.0),
+		envOrFloat("SEARCH_RECENCY_HALFLIFE_DAYS", 30.0)
 }
 
 const defaultSpace = "default"
@@ -218,8 +240,8 @@ var tools = []tool{
 	},
 	{
 		Name:        "search_memories",
-		Description: "Semantic search over stored memories in a space (default: \"default\") using pgvector cosine distance. Returns the closest matches with their full content.",
-		InputSchema: schema([]string{"query"}, map[string]string{"query": "string", "space": "string"}),
+		Description: "Hybrid search (semantic + keyword + recency) over stored memories in a space (default: \"default\"). Returns up to `limit` (default 5, max 20) closest matches with their full content.",
+		InputSchema: schema([]string{"query"}, map[string]string{"query": "string", "space": "string", "limit": "number"}),
 	},
 	{
 		Name:        "delete_memory",
@@ -277,10 +299,6 @@ func reassemble(space, name string) (string, error) {
 type nameDistance struct {
 	name string
 	dist float64
-}
-
-func sortMatchesByDistance(m []nameDistance) {
-	sort.Slice(m, func(i, j int) bool { return m[i].dist < m[j].dist })
 }
 
 func callTool(name string, args map[string]interface{}) map[string]interface{} {
@@ -382,32 +400,54 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		if q == "" {
 			return errResult("query is required")
 		}
+		limit := 5
+		if l, ok := args["limit"].(float64); ok && l > 0 {
+			limit = int(l)
+		}
+		if limit > 20 {
+			limit = 20
+		}
 		vec, err := embed(q)
 		if err != nil {
 			return internalErr("search_memories embed", err)
 		}
+		semanticW, keywordW, recencyW, halfLife := searchWeights()
 		rows, err := db.Query(`
-			SELECT DISTINCT ON (name) name, embedding <=> $1::vector AS distance
+			SELECT name, embedding <=> $1::vector AS distance,
+			       ts_rank(content_tsv, plainto_tsquery('english', $2)) AS rank,
+			       updated_at
 			FROM memories
-			WHERE space = $2
-			ORDER BY name, distance ASC
-		`, vectorLiteral(vec), space)
+			WHERE space = $3
+			ORDER BY distance ASC
+			LIMIT $4
+		`, vectorLiteral(vec), q, space, limit*5)
 		if err != nil {
 			return internalErr("search_memories query", err)
 		}
-		var matches []nameDistance
+		best := map[string]nameDistance{}
 		for rows.Next() {
-			var m nameDistance
-			if err := rows.Scan(&m.name, &m.dist); err != nil {
+			var n string
+			var dist, rank float64
+			var updatedAt time.Time
+			if err := rows.Scan(&n, &dist, &rank, &updatedAt); err != nil {
 				rows.Close()
 				return internalErr("search_memories scan", err)
 			}
-			matches = append(matches, m)
+			days := time.Since(updatedAt).Hours() / 24
+			recency := math.Exp(-math.Ln2 * days / halfLife)
+			score := semanticW*(1-dist) + keywordW*rank + recencyW*recency
+			if cur, ok := best[n]; !ok || score > cur.dist {
+				best[n] = nameDistance{name: n, dist: score}
+			}
 		}
 		rows.Close()
-		sortMatchesByDistance(matches)
-		if len(matches) > 5 {
-			matches = matches[:5]
+		matches := make([]nameDistance, 0, len(best))
+		for _, m := range best {
+			matches = append(matches, m)
+		}
+		sort.Slice(matches, func(i, j int) bool { return matches[i].dist > matches[j].dist })
+		if len(matches) > limit {
+			matches = matches[:limit]
 		}
 		if len(matches) == 0 {
 			return textResult("(no matches)")
@@ -418,7 +458,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			if err != nil {
 				return internalErr("search_memories reassemble", err)
 			}
-			out = append(out, fmt.Sprintf("%s (distance %.4f): %s", m.name, m.dist, content))
+			out = append(out, fmt.Sprintf("%s (score %.4f): %s", m.name, m.dist, content))
 		}
 		return textResult(strings.Join(out, "\n\n"))
 
