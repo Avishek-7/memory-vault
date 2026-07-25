@@ -23,6 +23,7 @@ What you expected to happen instead.
 
 - Go version (`go version`):
 - Postgres/pgvector version:
+- Embedding provider/model/dimension (`EMBED_PROVIDER` / `OPENAI_EMBED_MODEL` / `EMBED_DIM`, if not the default):
 - Ollama model(s) in use (`OLLAMA_EMBED_MODEL` / `OLLAMA_CHAT_MODEL`):
 - Deployment method: (Docker Compose / `docker run` / `go run` locally / other)
 - memory-vault version or commit SHA:
