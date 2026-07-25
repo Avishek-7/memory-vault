@@ -198,6 +198,7 @@ Environment variables:
 | `OPENAI_EMBED_API_KEY` | *(none)* | API key for the OpenAI-compatible endpoint; only used when `EMBED_PROVIDER=openai` |
 | `OPENAI_EMBED_MODEL` | `text-embedding-3-small` | Model name for the OpenAI-compatible endpoint; only used when `EMBED_PROVIDER=openai` |
 | `PORT` | `8080` | HTTP listen port |
+| `MAX_REQUEST_BODY_MB` | `25` | Max `/mcp` request body size, in MB — guards against unbounded-memory requests (e.g. an oversized `import_memories` payload) |
 | `AUTH_TOKEN` | *(none)* | Bearer token(s) required on `/mcp` (comma-separated for multiple clients). If unset, auth is disabled — set this in production. |
 | `ALLOWED_HOSTS` | *(none)* | Comma-separated `Host` header allowlist, guards against DNS-rebinding. If unset, the check is skipped — set this in production. |
 | `DB_MAX_OPEN_CONNS` | `10` | Max open Postgres connections |

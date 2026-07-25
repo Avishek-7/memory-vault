@@ -55,6 +55,13 @@ func ollamaURL() string       { return envOr("OLLAMA_URL", "http://localhost:114
 func ollamaModel() string     { return envOr("OLLAMA_EMBED_MODEL", "all-minilm") }
 func ollamaChatModel() string { return envOr("OLLAMA_CHAT_MODEL", "llama3.1:8b") }
 
+// maxRequestBodyBytes caps /mcp request bodies so a huge payload (an
+// oversized import_memories call, or just abuse) can't exhaust memory.
+// 25MB comfortably fits a large import_memories backup as JSON text.
+func maxRequestBodyBytes() int64 {
+	return int64(envOrInt("MAX_REQUEST_BODY_MB", 25)) * 1024 * 1024
+}
+
 // compactionSettings returns the cosine-distance threshold under which two
 // memories' centroid embeddings are considered near-duplicates, and the
 // staleness window (in days) past which a lone memory is still a compaction
@@ -733,9 +740,11 @@ func mcpHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes())
+
 	var req request
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON-RPC message", http.StatusBadRequest)
+		http.Error(w, "invalid or too-large JSON-RPC message", http.StatusBadRequest)
 		return
 	}
 
