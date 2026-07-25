@@ -512,10 +512,19 @@ func listResources() (interface{}, error) {
 	return map[string]interface{}{"resources": res}, nil
 }
 
-func readResource(uri string) (interface{}, error) {
+// parseResourceURI splits a "memory://<space>/<name>" URI into its parts.
+func parseResourceURI(uri string) (space, name string, ok bool) {
 	rest := strings.TrimPrefix(uri, "memory://")
-	space, name, ok := strings.Cut(rest, "/")
-	if !ok || space == "" || name == "" {
+	space, name, cut := strings.Cut(rest, "/")
+	if !cut || space == "" || name == "" {
+		return "", "", false
+	}
+	return space, name, true
+}
+
+func readResource(uri string) (interface{}, error) {
+	space, name, ok := parseResourceURI(uri)
+	if !ok {
 		return nil, fmt.Errorf("invalid resource uri %q", uri)
 	}
 	content, err := reassemble(space, name)
