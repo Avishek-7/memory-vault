@@ -113,7 +113,34 @@ func Open(cfg Config) (*Store, error) {
 	if _, err := db.Exec(migrationSQL(dim)); err != nil {
 		return nil, err
 	}
+	if err := checkEmbedDim(db, dim); err != nil {
+		return nil, err
+	}
 	return &Store{DB: db, Embedder: embedder, EmbedDim: dim}, nil
+}
+
+// checkEmbedDim fails fast, with a clear message, if memories.embedding
+// already exists at a different dimension than the configured EmbedDim.
+// CREATE TABLE IF NOT EXISTS is a no-op against an existing table, so
+// without this check a dimension change on an existing database would
+// otherwise surface as a confusing Postgres error on the first insert.
+func checkEmbedDim(db *sql.DB, dim int) error {
+	var actual int
+	err := db.QueryRow(`
+		SELECT atttypmod FROM pg_attribute
+		WHERE attrelid = 'memories'::regclass AND attname = 'embedding'
+	`).Scan(&actual)
+	if err != nil {
+		return fmt.Errorf("checking memories.embedding dimension: %w", err)
+	}
+	if actual > 0 && actual != dim {
+		return fmt.Errorf(
+			"memories.embedding is %d-dimensional in the database but EMBED_DIM=%d — "+
+				"switching embedding dimension/model on an existing database isn't supported "+
+				"(see README's \"Using a different embedding backend\"); start from a fresh database instead",
+			actual, dim)
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.DB.Close() }

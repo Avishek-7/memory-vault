@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // Embedder turns text into a vector. Implementations must always return
@@ -18,6 +19,10 @@ import (
 type Embedder interface {
 	Embed(text string) ([]float32, error)
 }
+
+// httpClient is shared by both Embedders so a hung Ollama/OpenAI-compatible
+// endpoint can't block a request goroutine forever.
+var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 // OllamaEmbedder calls a local Ollama server's /api/embeddings endpoint.
 type OllamaEmbedder struct {
@@ -30,7 +35,12 @@ func (o *OllamaEmbedder) Embed(text string) ([]float32, error) {
 		"model":  o.Model,
 		"prompt": text,
 	})
-	resp, err := http.Post(o.URL+"/api/embeddings", "application/json", bytes.NewReader(reqBody))
+	req, err := http.NewRequest(http.MethodPost, o.URL+"/api/embeddings", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("ollama request failed (is Ollama running with %q pulled?): %w", o.Model, err)
 	}
@@ -69,7 +79,7 @@ func (o *OpenAIEmbedder) Embed(text string) ([]float32, error) {
 	if o.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+o.APIKey)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("openai-compatible embeddings request failed: %w", err)
 	}
