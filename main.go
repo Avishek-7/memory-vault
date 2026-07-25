@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"memory-vault/internal/embed"
 	"memory-vault/internal/store"
 )
 
@@ -60,14 +61,32 @@ func compactionSettings() (similarityThreshold float64, staleDays int) {
 	return envOrFloat("COMPACT_SIMILARITY_THRESHOLD", 0.15), envOrInt("COMPACT_STALE_DAYS", 90)
 }
 
+// embedderFromEnv picks the Embedder per EMBED_PROVIDER (default "ollama",
+// today's only behavior). "openai" is an escape hatch for an
+// OpenAI-compatible embeddings endpoint (OpenAI itself, or a self-hosted
+// server like LiteLLM/text-embeddings-inference) — not a recommendation
+// to move off the local-first default.
+func embedderFromEnv() embed.Embedder {
+	switch envOr("EMBED_PROVIDER", "ollama") {
+	case "openai":
+		return &embed.OpenAIEmbedder{
+			BaseURL: envOr("OPENAI_EMBED_BASE_URL", "https://api.openai.com/v1"),
+			APIKey:  os.Getenv("OPENAI_EMBED_API_KEY"),
+			Model:   envOr("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
+		}
+	default:
+		return &embed.OllamaEmbedder{URL: ollamaURL(), Model: ollamaModel()}
+	}
+}
+
 func storeConfig() store.Config {
 	return store.Config{
-		DatabaseURL:      os.Getenv("DATABASE_URL"),
-		OllamaURL:        ollamaURL(),
-		OllamaEmbedModel: ollamaModel(),
-		MaxOpenConns:     envOrInt("DB_MAX_OPEN_CONNS", 10),
-		MaxIdleConns:     envOrInt("DB_MAX_IDLE_CONNS", 5),
-		ConnMaxLifetime:  time.Duration(envOrInt("DB_CONN_MAX_LIFETIME_MIN", 30)) * time.Minute,
+		DatabaseURL:     os.Getenv("DATABASE_URL"),
+		Embedder:        embedderFromEnv(),
+		EmbedDim:        envOrInt("EMBED_DIM", store.DefaultEmbedDim),
+		MaxOpenConns:    envOrInt("DB_MAX_OPEN_CONNS", 10),
+		MaxIdleConns:    envOrInt("DB_MAX_IDLE_CONNS", 5),
+		ConnMaxLifetime: time.Duration(envOrInt("DB_CONN_MAX_LIFETIME_MIN", 30)) * time.Minute,
 	}
 }
 

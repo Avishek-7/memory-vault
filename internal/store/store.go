@@ -5,72 +5,85 @@
 package store
 
 import (
-	"bytes"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"math"
-	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
+
+	"memory-vault/internal/embed"
 )
 
-const EmbedDim = 384
+// DefaultEmbedDim is the dimension of Ollama's all-minilm model, the
+// default Embedder. A different Embedder/EMBED_DIM is an escape hatch —
+// see Config.EmbedDim.
+const DefaultEmbedDim = 384
 
 // chunkTargetWords/chunkOverlapWords approximate all-minilm's 256-token
-// budget via word count (~0.75 words/token), leaving headroom.
+// budget via word count (~0.75 words/token), leaving headroom. Other
+// embedding models may have a different real budget; this is a fixed
+// approximation regardless of the configured Embedder.
 const chunkTargetWords = 150
 const chunkOverlapWords = 15
 
 const DefaultSpace = "default"
 
-const migrationSQL = `
-	CREATE EXTENSION IF NOT EXISTS vector;
-	CREATE TABLE IF NOT EXISTS memories (
-		space       TEXT NOT NULL DEFAULT 'default',
-		name        TEXT NOT NULL,
-		chunk_index INT NOT NULL DEFAULT 0,
-		content     TEXT NOT NULL,
-		embedding   vector(384) NOT NULL,
-		updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-		PRIMARY KEY (space, name, chunk_index)
-	);
-	ALTER TABLE memories ADD COLUMN IF NOT EXISTS chunk_index INT NOT NULL DEFAULT 0;
-	ALTER TABLE memories ADD COLUMN IF NOT EXISTS space TEXT NOT NULL DEFAULT 'default';
-	DO $$
-	BEGIN
-		IF (SELECT array_length(conkey, 1) FROM pg_constraint
-			WHERE conrelid = 'memories'::regclass AND contype = 'p') < 3 THEN
-			ALTER TABLE memories DROP CONSTRAINT memories_pkey;
-			ALTER TABLE memories ADD PRIMARY KEY (space, name, chunk_index);
-		END IF;
-	END $$;
-	CREATE INDEX IF NOT EXISTS memories_embedding_idx
-		ON memories USING hnsw (embedding vector_cosine_ops);
-	ALTER TABLE memories ADD COLUMN IF NOT EXISTS content_tsv tsvector
-		GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
-	CREATE INDEX IF NOT EXISTS memories_content_tsv_idx ON memories USING GIN (content_tsv);
-`
+// migrationSQL is templated on the embedding dimension so a non-default
+// EMBED_DIM is reflected in the vector column at table-creation time.
+func migrationSQL(dim int) string {
+	return fmt.Sprintf(`
+		CREATE EXTENSION IF NOT EXISTS vector;
+		CREATE TABLE IF NOT EXISTS memories (
+			space       TEXT NOT NULL DEFAULT 'default',
+			name        TEXT NOT NULL,
+			chunk_index INT NOT NULL DEFAULT 0,
+			content     TEXT NOT NULL,
+			embedding   vector(%d) NOT NULL,
+			updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+			PRIMARY KEY (space, name, chunk_index)
+		);
+		ALTER TABLE memories ADD COLUMN IF NOT EXISTS chunk_index INT NOT NULL DEFAULT 0;
+		ALTER TABLE memories ADD COLUMN IF NOT EXISTS space TEXT NOT NULL DEFAULT 'default';
+		DO $$
+		BEGIN
+			IF (SELECT array_length(conkey, 1) FROM pg_constraint
+				WHERE conrelid = 'memories'::regclass AND contype = 'p') < 3 THEN
+				ALTER TABLE memories DROP CONSTRAINT memories_pkey;
+				ALTER TABLE memories ADD PRIMARY KEY (space, name, chunk_index);
+			END IF;
+		END $$;
+		CREATE INDEX IF NOT EXISTS memories_embedding_idx
+			ON memories USING hnsw (embedding vector_cosine_ops);
+		ALTER TABLE memories ADD COLUMN IF NOT EXISTS content_tsv tsvector
+			GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
+		CREATE INDEX IF NOT EXISTS memories_content_tsv_idx ON memories USING GIN (content_tsv);
+	`, dim)
+}
 
-// Config configures a Store: how to reach Postgres and the Ollama server
-// used for embeddings.
+// Config configures a Store: how to reach Postgres and which Embedder to
+// use for turning memory content into vectors.
 type Config struct {
-	DatabaseURL      string
-	OllamaURL        string
-	OllamaEmbedModel string
-	MaxOpenConns     int
-	MaxIdleConns     int
-	ConnMaxLifetime  time.Duration
+	DatabaseURL string
+	// Embedder defaults to an OllamaEmbedder against localhost:11434
+	// running all-minilm if left nil.
+	Embedder embed.Embedder
+	// EmbedDim must match the dimension Embedder actually returns; it's
+	// baked into the vector column at table-creation time. Defaults to
+	// DefaultEmbedDim if <= 0.
+	EmbedDim        int
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
 }
 
 type Store struct {
-	DB               *sql.DB
-	OllamaURL        string
-	OllamaEmbedModel string
+	DB       *sql.DB
+	Embedder embed.Embedder
+	EmbedDim int
 }
 
 // Open connects to Postgres, applies pool settings, and runs the (idempotent)
@@ -78,6 +91,14 @@ type Store struct {
 func Open(cfg Config) (*Store, error) {
 	if cfg.DatabaseURL == "" {
 		return nil, fmt.Errorf("DatabaseURL is not set")
+	}
+	dim := cfg.EmbedDim
+	if dim <= 0 {
+		dim = DefaultEmbedDim
+	}
+	embedder := cfg.Embedder
+	if embedder == nil {
+		embedder = &embed.OllamaEmbedder{URL: "http://localhost:11434", Model: "all-minilm"}
 	}
 	db, err := sql.Open("postgres", cfg.DatabaseURL)
 	if err != nil {
@@ -89,10 +110,10 @@ func Open(cfg Config) (*Store, error) {
 	db.SetMaxOpenConns(cfg.MaxOpenConns)
 	db.SetMaxIdleConns(cfg.MaxIdleConns)
 	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
-	if _, err := db.Exec(migrationSQL); err != nil {
+	if _, err := db.Exec(migrationSQL(dim)); err != nil {
 		return nil, err
 	}
-	return &Store{DB: db, OllamaURL: cfg.OllamaURL, OllamaEmbedModel: cfg.OllamaEmbedModel}, nil
+	return &Store{DB: db, Embedder: embedder, EmbedDim: dim}, nil
 }
 
 func (s *Store) Close() error { return s.DB.Close() }
@@ -122,31 +143,19 @@ func ChunkContent(content string) []string {
 	return chunks
 }
 
-// Embed calls the configured Ollama server to turn text into an
-// EmbedDim-dimensional vector.
+// Embed turns text into a vector via the configured Embedder, checking
+// its length against EmbedDim immediately so a misconfigured/mismatched
+// embedding backend fails here with a clear message rather than deep
+// inside a SQL insert.
 func (s *Store) Embed(text string) ([]float32, error) {
-	reqBody, _ := json.Marshal(map[string]string{
-		"model":  s.OllamaEmbedModel,
-		"prompt": text,
-	})
-	resp, err := http.Post(s.OllamaURL+"/api/embeddings", "application/json", bytes.NewReader(reqBody))
+	vec, err := s.Embedder.Embed(text)
 	if err != nil {
-		return nil, fmt.Errorf("ollama request failed (is Ollama running with %q pulled?): %w", s.OllamaEmbedModel, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("ollama returned status %d", resp.StatusCode)
-	}
-	var out struct {
-		Embedding []float32 `json:"embedding"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
-	if len(out.Embedding) != EmbedDim {
-		return nil, fmt.Errorf("expected %d-dim embedding, got %d", EmbedDim, len(out.Embedding))
+	if len(vec) != s.EmbedDim {
+		return nil, fmt.Errorf("embedder returned a %d-dimension vector, want %d (set EMBED_DIM to match, or check the embedding model)", len(vec), s.EmbedDim)
 	}
-	return out.Embedding, nil
+	return vec, nil
 }
 
 // VectorLiteral formats a float32 slice as pgvector's text input format, e.g. "[0.1,0.2,0.3]".

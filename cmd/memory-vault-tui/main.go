@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"memory-vault/internal/embed"
 	"memory-vault/internal/store"
 )
 
@@ -25,14 +27,42 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+func envOrInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
+// embedderFromEnv mirrors main.go's EMBED_PROVIDER handling, so the TUI
+// reads/writes memories with whichever embedding backend the MCP server
+// is configured to use.
+func embedderFromEnv() embed.Embedder {
+	switch envOr("EMBED_PROVIDER", "ollama") {
+	case "openai":
+		return &embed.OpenAIEmbedder{
+			BaseURL: envOr("OPENAI_EMBED_BASE_URL", "https://api.openai.com/v1"),
+			APIKey:  os.Getenv("OPENAI_EMBED_API_KEY"),
+			Model:   envOr("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
+		}
+	default:
+		return &embed.OllamaEmbedder{
+			URL:   envOr("OLLAMA_URL", "http://localhost:11434"),
+			Model: envOr("OLLAMA_EMBED_MODEL", "all-minilm"),
+		}
+	}
+}
+
 func storeConfig() store.Config {
 	return store.Config{
-		DatabaseURL:      os.Getenv("DATABASE_URL"),
-		OllamaURL:        envOr("OLLAMA_URL", "http://localhost:11434"),
-		OllamaEmbedModel: envOr("OLLAMA_EMBED_MODEL", "all-minilm"),
-		MaxOpenConns:     5,
-		MaxIdleConns:     2,
-		ConnMaxLifetime:  30 * time.Minute,
+		DatabaseURL:     os.Getenv("DATABASE_URL"),
+		Embedder:        embedderFromEnv(),
+		EmbedDim:        envOrInt("EMBED_DIM", store.DefaultEmbedDim),
+		MaxOpenConns:    5,
+		MaxIdleConns:    2,
+		ConnMaxLifetime: 30 * time.Minute,
 	}
 }
 

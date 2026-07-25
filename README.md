@@ -161,6 +161,11 @@ Environment variables:
 | `OLLAMA_URL` | `http://localhost:11434` | Base URL of the Ollama server |
 | `OLLAMA_EMBED_MODEL` | `all-minilm` | Ollama embedding model name |
 | `OLLAMA_CHAT_MODEL` | `llama3.1:8b` | Ollama chat model used only by `compact_memories` |
+| `EMBED_PROVIDER` | `ollama` | Embedding backend: `ollama` (default) or `openai` — see [Using a different embedding backend](#using-a-different-embedding-backend) |
+| `EMBED_DIM` | `384` | Dimension of the configured embedder's vectors; baked into the `embedding` column at table-creation time |
+| `OPENAI_EMBED_BASE_URL` | `https://api.openai.com/v1` | Base URL for an OpenAI-compatible embeddings endpoint; only used when `EMBED_PROVIDER=openai` |
+| `OPENAI_EMBED_API_KEY` | *(none)* | API key for the OpenAI-compatible endpoint; only used when `EMBED_PROVIDER=openai` |
+| `OPENAI_EMBED_MODEL` | `text-embedding-3-small` | Model name for the OpenAI-compatible endpoint; only used when `EMBED_PROVIDER=openai` |
 | `PORT` | `8080` | HTTP listen port |
 | `AUTH_TOKEN` | *(none)* | Bearer token(s) required on `/mcp` (comma-separated for multiple clients). If unset, auth is disabled — set this in production. |
 | `ALLOWED_HOSTS` | *(none)* | Comma-separated `Host` header allowlist, guards against DNS-rebinding. If unset, the check is skipped — set this in production. |
@@ -173,6 +178,30 @@ Environment variables:
 | `SEARCH_RECENCY_HALFLIFE_DAYS` | `30` | Half-life, in days, for the recency decay factor |
 | `COMPACT_SIMILARITY_THRESHOLD` | `0.15` | Cosine-distance threshold under which two memories' embeddings are treated as near-duplicates by `compact_memories` |
 | `COMPACT_STALE_DAYS` | `90` | Age (in days since `updated_at`) past which a lone memory is still a `compact_memories` candidate for solo re-summarization |
+
+## Using a different embedding backend
+
+The local-first default (Ollama, `all-minilm`, 384-dim) is intentional —
+it's the whole point of this project — not a placeholder waiting for you
+to switch to a hosted API. But if you'd rather point at an
+OpenAI-compatible embeddings endpoint (OpenAI itself, or a self-hosted
+OpenAI-compatible server like LiteLLM or text-embeddings-inference), set:
+
+```
+EMBED_PROVIDER=openai
+OPENAI_EMBED_BASE_URL=https://api.openai.com/v1
+OPENAI_EMBED_API_KEY=sk-...
+OPENAI_EMBED_MODEL=text-embedding-3-small
+EMBED_DIM=1536
+```
+
+`EMBED_DIM` must match whatever the configured model actually returns —
+it's checked on every embed call, and gets baked into the Postgres
+`vector` column when the table is first created. Switching `EMBED_DIM`
+or embedding models on an existing database won't retroactively
+re-embed anything or resize the column; start from a fresh database (or
+`export_memories`/`import_memories` — see below — into a new one) if you
+change backends after memories already exist.
 
 ## Run locally
 
