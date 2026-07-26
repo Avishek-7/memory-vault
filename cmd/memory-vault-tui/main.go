@@ -16,6 +16,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"memory-vault/internal/chat"
 	"memory-vault/internal/embed"
 	"memory-vault/internal/store"
 )
@@ -75,6 +76,8 @@ func storeConfig() (store.Config, error) {
 
 func editor() string { return envOr("EDITOR", "nvim") }
 
+func ollamaChatModel() string { return envOr("OLLAMA_CHAT_MODEL", "llama3.1:8b") }
+
 // --- styling: monochrome-friendly, borders/bold over color ---
 
 var (
@@ -101,7 +104,7 @@ func rowsFromAll(all []store.SpaceName) []row {
 			rows = append(rows, row{isHeader: true, space: sn.Space, label: sn.Space})
 			cur = sn.Space
 		}
-		rows = append(rows, row{space: sn.Space, name: sn.Name, label: sn.Name})
+		rows = append(rows, row{space: sn.Space, name: sn.Name, label: fmt.Sprintf("%s  (%s, %s)", sn.Name, sn.Source, sn.Kind)})
 	}
 	return rows
 }
@@ -122,6 +125,8 @@ type rowsLoadedMsg struct {
 }
 type contentLoadedMsg struct {
 	content string
+	source  string
+	kind    string
 	err     error
 }
 type searchDoneMsg struct {
@@ -136,6 +141,10 @@ type editDoneMsg struct {
 	space, name, content string
 	err                  error
 }
+type sessionSummaryDoneMsg struct {
+	content string
+	err     error
+}
 
 // --- model ---
 
@@ -148,6 +157,8 @@ const (
 	modeConfirmDelete
 	modeNewName
 	modeNewSpace
+	modeNewSource
+	modeNewKind
 	modeNewContent // waiting on $EDITOR
 )
 
@@ -158,12 +169,16 @@ type model struct {
 	cursor       int
 	currentSpace string // space of the last-selected item; also the search/new default
 
-	content  string
-	viewport viewport.Model
+	content       string
+	currentSource string
+	currentKind   string
+	viewport      viewport.Model
 
 	mode      mode
 	input     textinput.Model
 	newName   string
+	newSpace  string
+	newSource string
 	pending   row // for delete confirmation
 	status    string
 	statusErr bool
@@ -184,21 +199,21 @@ func (m model) Init() tea.Cmd {
 
 func loadRowsCmd(st *store.Store) tea.Cmd {
 	return func() tea.Msg {
-		all, err := st.ListAll()
+		all, err := st.ListAll("", "")
 		return rowsLoadedMsg{rows: rowsFromAll(all), err: err}
 	}
 }
 
 func loadContentCmd(st *store.Store, space, name string) tea.Cmd {
 	return func() tea.Msg {
-		content, err := st.Reassemble(space, name)
-		return contentLoadedMsg{content: content, err: err}
+		meta, err := st.ReassembleMeta(space, name)
+		return contentLoadedMsg{content: meta.Content, source: meta.Source, kind: meta.Kind, err: err}
 	}
 }
 
 func searchCmd(st *store.Store, space, query string) tea.Cmd {
 	return func() tea.Msg {
-		matches, err := st.SearchMemories(space, query, 10, store.SearchWeights{Semantic: 1.0, HalfLifeDays: 30})
+		matches, err := st.SearchMemories(space, query, 10, store.SearchWeights{Semantic: 1.0, HalfLifeDays: 30}, "", "")
 		return searchDoneMsg{matches: matches, err: err}
 	}
 }
@@ -210,9 +225,36 @@ func deleteCmd(st *store.Store, space, name string) tea.Cmd {
 	}
 }
 
+// sessionSummaryCmd builds get_session_summary's resume prompt from a
+// space's most-recently-updated memories and sends it through ollamaChat.
+// Read-only — writes nothing.
+func sessionSummaryCmd(st *store.Store, space string) tea.Cmd {
+	return func() tea.Msg {
+		recents, err := st.RecentMemories(space, 15)
+		if err != nil {
+			return sessionSummaryDoneMsg{err: err}
+		}
+		if len(recents) == 0 {
+			return sessionSummaryDoneMsg{content: fmt.Sprintf("(no memories yet in space %q)", space)}
+		}
+		prompt := chat.SessionSummaryPrompt(space, recents)
+		summary, err := chat.Chat(envOr("OLLAMA_URL", "http://localhost:11434"), ollamaChatModel(), prompt)
+		if err != nil {
+			return sessionSummaryDoneMsg{err: err}
+		}
+		summary = strings.TrimSpace(summary)
+		if summary == "" {
+			return sessionSummaryDoneMsg{err: fmt.Errorf("ollama returned an empty summary")}
+		}
+		return sessionSummaryDoneMsg{content: summary}
+	}
+}
+
 // editCmd suspends the TUI, opens content in $EDITOR against a temp file,
-// and on return reads it back and saves it via the store.
-func editCmd(st *store.Store, space, name, content string) tea.Cmd {
+// and on return reads it back and saves it via the store. source/kind are
+// preserved as-is for an edit of an existing memory, or whatever the user
+// entered when creating a new one.
+func editCmd(st *store.Store, space, name, content, source, kind string) tea.Cmd {
 	f, err := os.CreateTemp("", "memory-vault-*.md")
 	if err != nil {
 		return func() tea.Msg { return editDoneMsg{err: err} }
@@ -235,7 +277,7 @@ func editCmd(st *store.Store, space, name, content string) tea.Cmd {
 		if text == "" {
 			return editDoneMsg{err: fmt.Errorf("empty content, not saved")}
 		}
-		if _, err := st.SaveMemory(space, name, text); err != nil {
+		if _, err := st.SaveMemory(space, name, text, source, kind); err != nil {
 			return editDoneMsg{err: err}
 		}
 		return editDoneMsg{space: space, name: name, content: text}
@@ -305,6 +347,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.content = msg.content
+		m.currentSource = msg.source
+		m.currentKind = msg.kind
 		m.viewport.SetContent(msg.content)
 		m.viewport.GotoTop()
 		return m, nil
@@ -337,6 +381,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mode = modeBrowse
 		return m, loadRowsCmd(m.st)
 
+	case sessionSummaryDoneMsg:
+		m.statusErr = msg.err != nil
+		if msg.err != nil {
+			m.status = "session summary: " + msg.err.Error()
+			return m, nil
+		}
+		m.content = msg.content
+		m.viewport.SetContent(msg.content)
+		m.viewport.GotoTop()
+		m.status = fmt.Sprintf("session summary for space %q", m.currentSpace)
+		return m, nil
+
 	case editDoneMsg:
 		m.statusErr = msg.err != nil
 		if msg.err != nil {
@@ -359,7 +415,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.mode {
-	case modeSearchInput, modeNewName, modeNewSpace:
+	case modeSearchInput, modeNewName, modeNewSpace, modeNewSource, modeNewKind:
 		switch msg.String() {
 		case "esc":
 			m.mode = modeBrowse
@@ -387,12 +443,39 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.input.Focus()
 				return m, nil
 			case modeNewSpace:
-				space := value
-				if space == "" {
-					space = store.DefaultSpace
+				m.newSpace = value
+				if m.newSpace == "" {
+					m.newSpace = store.DefaultSpace
+				}
+				m.mode = modeNewSource
+				m.input.SetValue("")
+				m.input.Placeholder = store.DefaultSource
+				m.input.Focus()
+				return m, nil
+			case modeNewSource:
+				m.newSource = value
+				if m.newSource == "" {
+					m.newSource = store.DefaultSource
+				}
+				m.mode = modeNewKind
+				m.input.SetValue("")
+				m.input.Placeholder = store.DefaultKind
+				m.input.Focus()
+				return m, nil
+			case modeNewKind:
+				kind := value
+				if kind == "" {
+					kind = store.DefaultKind
+				}
+				if !store.IsValidKind(kind) {
+					m.status = fmt.Sprintf("invalid kind %q, want one of: %s", kind, strings.Join(store.ValidKinds, ", "))
+					m.statusErr = true
+					m.input.SetValue("")
+					m.input.Focus() // Enter always Blur()s above; re-focus so the re-prompt still accepts keystrokes
+					return m, nil   // stay in modeNewKind, re-prompt
 				}
 				m.mode = modeNewContent
-				return m, editCmd(m.st, space, m.newName, "")
+				return m, editCmd(m.st, m.newSpace, m.newName, "", m.newSource, kind)
 			}
 		}
 		var cmd tea.Cmd
@@ -447,7 +530,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "e":
 			if r, ok := m.selected(); ok {
-				return m, editCmd(m.st, r.space, r.name, m.content)
+				return m, editCmd(m.st, r.space, r.name, m.content, m.currentSource, m.currentKind)
 			}
 			return m, nil
 		case "d":
@@ -456,6 +539,10 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.mode = modeConfirmDelete
 			}
 			return m, nil
+		case "s":
+			m.status = fmt.Sprintf("generating session summary for space %q...", m.currentSpace)
+			m.statusErr = false
+			return m, sessionSummaryCmd(m.st, m.currentSpace)
 		}
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
@@ -506,6 +593,10 @@ func (m model) View() string {
 		bottom = "new memory name: " + m.input.View()
 	case modeNewSpace:
 		bottom = "space (" + store.DefaultSpace + "): " + m.input.View()
+	case modeNewSource:
+		bottom = "source (" + store.DefaultSource + "): " + m.input.View()
+	case modeNewKind:
+		bottom = "kind (" + store.DefaultKind + ", one of " + strings.Join(store.ValidKinds, "/") + "): " + m.input.View()
 	case modeConfirmDelete:
 		bottom = fmt.Sprintf("delete %q from space %q? (y/N)", m.pending.name, m.pending.space)
 	default:
@@ -513,7 +604,7 @@ func (m model) View() string {
 		if m.statusErr {
 			status = "error: " + status
 		}
-		keys := dimStyle.Render("/ search   e edit   n new   d delete   q quit")
+		keys := dimStyle.Render("/ search   e edit   n new   d delete   s summary   q quit")
 		if status != "" {
 			bottom = status + "   " + keys
 		} else {

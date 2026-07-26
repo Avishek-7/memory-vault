@@ -5,11 +5,11 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"memory-vault/internal/chat"
 	"memory-vault/internal/embed"
 	"memory-vault/internal/store"
 )
@@ -107,14 +108,39 @@ func storeConfig() (store.Config, error) {
 }
 
 // search scoring weights: default to semantic-only ranking (identical to
-// pre-hybrid-search behavior) unless overridden.
+// pre-hybrid-search behavior) unless overridden. Per-kind boosts all default
+// to 0 (no ranking change) unless a SEARCH_KIND_BOOST_<KIND> env var opts in.
 func searchWeights() store.SearchWeights {
+	boosts := map[string]float64{}
+	for _, k := range store.ValidKinds {
+		boosts[k] = envOrFloat("SEARCH_KIND_BOOST_"+strings.ToUpper(k), 0.0)
+	}
 	return store.SearchWeights{
 		Semantic:     envOrFloat("SEARCH_WEIGHT_SEMANTIC", 1.0),
 		Keyword:      envOrFloat("SEARCH_WEIGHT_KEYWORD", 0.0),
 		Recency:      envOrFloat("SEARCH_WEIGHT_RECENCY", 0.0),
 		HalfLifeDays: envOrFloat("SEARCH_RECENCY_HALFLIFE_DAYS", 30.0),
+		KindBoost:    boosts,
 	}
+}
+
+// validKindsList renders store.ValidKinds for error messages, e.g.
+// `"fact", "decision", "preference", "task", "note"`.
+func validKindsList() string {
+	return quotedList(store.ValidKinds)
+}
+
+// validFlagsList renders store.ValidFlags for error messages.
+func validFlagsList() string {
+	return quotedList(store.ValidFlags)
+}
+
+func quotedList(vals []string) string {
+	quoted := make([]string, len(vals))
+	for i, v := range vals {
+		quoted[i] = fmt.Sprintf("%q", v)
+	}
+	return strings.Join(quoted, ", ")
 }
 
 func argSpace(args map[string]interface{}) string {
@@ -125,30 +151,25 @@ func argSpace(args map[string]interface{}) string {
 }
 
 // ollamaChat sends a single-turn prompt to the local Ollama chat model and
-// returns its response text. Used only by compact_memories, never search/save.
+// returns its response text. Used by compact_memories and
+// get_session_summary, never search/save.
 func ollamaChat(prompt string) (string, error) {
-	reqBody, _ := json.Marshal(map[string]interface{}{
-		"model":    ollamaChatModel(),
-		"messages": []map[string]string{{"role": "user", "content": prompt}},
-		"stream":   false,
-	})
-	resp, err := http.Post(ollamaURL()+"/api/chat", "application/json", bytes.NewReader(reqBody))
+	return chat.Chat(ollamaURL(), ollamaChatModel(), prompt)
+}
+
+// sessionSummaryPrompt builds a resume prompt from a space's recent
+// memories (via the shared internal/chat template, so the TUI's "s"
+// keybinding can't drift out of sync) and sends it through ollamaChat.
+func sessionSummaryPrompt(space string, recents []store.RecentMemory) (string, error) {
+	summary, err := ollamaChat(chat.SessionSummaryPrompt(space, recents))
 	if err != nil {
-		return "", fmt.Errorf("ollama chat request failed (is Ollama running with %q pulled?): %w", ollamaChatModel(), err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("ollama chat returned status %d", resp.StatusCode)
-	}
-	var out struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", err
 	}
-	return out.Message.Content, nil
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		return "", fmt.Errorf("ollama returned an empty summary")
+	}
+	return summary, nil
 }
 
 // --- JSON-RPC plumbing ---
@@ -191,8 +212,8 @@ type tool struct {
 var tools = []tool{
 	{
 		Name:        "save_memory",
-		Description: "Create or overwrite a memory by name with the given content, optionally in a named space (default: \"default\"). Content is chunked and embedded via Ollama for later semantic search.",
-		InputSchema: schema([]string{"name", "content"}, map[string]string{"name": "string", "content": "string", "space": "string"}),
+		Description: "Create or overwrite a memory by name with the given content, optionally in a named space (default: \"default\"). Content is chunked and embedded via Ollama for later semantic search. Optional source records which agent wrote it (default: \"unspecified\"); optional expect_source rejects the write instead of overwriting if a memory already exists there under a different source. Optional kind (default: \"note\") is one of fact, decision, preference, task, note.",
+		InputSchema: schema([]string{"name", "content"}, map[string]string{"name": "string", "content": "string", "space": "string", "source": "string", "expect_source": "string", "kind": "string"}),
 	},
 	{
 		Name:        "get_memory",
@@ -201,13 +222,13 @@ var tools = []tool{
 	},
 	{
 		Name:        "list_memories",
-		Description: "List the names of stored memories. Pass space to filter to one space; omit it to list all memories grouped by space.",
-		InputSchema: schema(nil, map[string]string{"space": "string"}),
+		Description: "List the names of stored memories. Pass space to filter to one space; omit it to list all memories grouped by space. Optional source/kind filters narrow the results.",
+		InputSchema: schema(nil, map[string]string{"space": "string", "source": "string", "kind": "string"}),
 	},
 	{
 		Name:        "search_memories",
-		Description: "Hybrid search (semantic + keyword + recency) over stored memories in a space (default: \"default\"). Returns up to `limit` (default 5, max 20) closest matches with their full content.",
-		InputSchema: schema([]string{"query"}, map[string]string{"query": "string", "space": "string", "limit": "number"}),
+		Description: "Hybrid search (semantic + keyword + recency + optional per-kind boost) over stored memories in a space (default: \"default\"). Returns up to `limit` (default 5, max 20) closest matches with their full content. Optional source/kind filters narrow the candidates.",
+		InputSchema: schema([]string{"query"}, map[string]string{"query": "string", "space": "string", "limit": "number", "source": "string", "kind": "string"}),
 	},
 	{
 		Name:        "delete_memory",
@@ -215,19 +236,29 @@ var tools = []tool{
 		InputSchema: schema([]string{"name"}, map[string]string{"name": "string", "space": "string"}),
 	},
 	{
+		Name:        "flag_memory",
+		Description: "Set a usage/quality flag on a memory: useful, stale, or wrong. A new flag overwrites any previous one — a memory has one current flag, not a history. Influences compact_memories candidate selection: stale/wrong make a memory a stronger candidate regardless of age; useful protects it from age-based (but not similarity-based) selection. Optional note explains why.",
+		InputSchema: schema([]string{"name", "flag"}, map[string]string{"name": "string", "space": "string", "flag": "string", "note": "string"}),
+	},
+	{
 		Name:        "compact_memories",
-		Description: "Find near-duplicate or stale memories (within a space, or all spaces if omitted) and merge/summarize them via the local Ollama chat model. dry_run (default true) returns the proposed plan without writing anything.",
+		Description: "Find near-duplicate or stale memories (within a space, or all spaces if omitted) and merge/summarize them via the local Ollama chat model. Memories of kind \"decision\" are never selected for compaction. dry_run (default true) returns the proposed plan without writing anything.",
 		InputSchema: schema(nil, map[string]string{"space": "string", "dry_run": "boolean"}),
 	},
 	{
 		Name:        "export_memories",
-		Description: "Export memories as JSON (name, space, content, updated_at — no embeddings, which are cheap to regenerate on import). Optional space exports just that space; omit it to export everything.",
-		InputSchema: schema(nil, map[string]string{"space": "string"}),
+		Description: "Export memories as JSON (name, space, source, kind, content, updated_at — no embeddings, which are cheap to regenerate on import). Optional space exports just that space; optional source exports just that source; omit both to export everything.",
+		InputSchema: schema(nil, map[string]string{"space": "string", "source": "string"}),
+	},
+	{
+		Name:        "get_session_summary",
+		Description: "Read-only resume of a space's recent state (default space: \"default\") for picking up work after a new session/context reset: what's the current state, what was decided, what's still open, likely next step. Summarizes the most recently updated memories (favoring task/decision kind) via the local Ollama chat model. Use this to resume broad context; use search_memories to find one specific fact instead. Optional limit caps how many recent memories it considers (default 15, max 50).",
+		InputSchema: schema(nil, map[string]string{"space": "string", "limit": "number"}),
 	},
 	{
 		Name:        "import_memories",
-		Description: "Import memories from a JSON payload in the shape export_memories produces. Re-chunks and re-embeds every memory through the normal save path. Optional space sends every imported memory there regardless of what's in the data (useful for merging a backup into a differently-named space); optional overwrite (default false) controls whether memories that already exist are replaced or skipped.",
-		InputSchema: schema([]string{"data"}, map[string]string{"data": "string", "space": "string", "overwrite": "boolean"}),
+		Description: "Import memories from a JSON payload in the shape export_memories produces. Re-chunks and re-embeds every memory through the normal save path. Optional space sends every imported memory there regardless of what's in the data (useful for merging a backup into a differently-named space); optional source does the same for source (otherwise each memory keeps its recorded source, or \"unspecified\" if the export predates the source field); optional overwrite (default false) controls whether memories that already exist are replaced or skipped.",
+		InputSchema: schema([]string{"data"}, map[string]string{"data": "string", "space": "string", "source": "string", "overwrite": "boolean"}),
 	},
 }
 
@@ -273,9 +304,19 @@ func compactTargetName(names []string) string {
 // chain of near-duplicate centroids), plus lone memories past the
 // staleness window (candidates for solo re-summarization).
 func compactGroupsForSpace(space string) ([][]store.MemoryCentroid, error) {
-	infos, err := st.MemoryCentroids(space)
+	all, err := st.MemoryCentroids(space)
 	if err != nil {
 		return nil, err
+	}
+	// Decisions are never compaction candidates — they record something
+	// that was explicitly decided, and merging or age-based pruning could
+	// silently lose that. Excluded here, before grouping, so they can't be
+	// pulled into a sibling's merge either.
+	var infos []store.MemoryCentroid
+	for _, m := range all {
+		if m.Kind != "decision" {
+			infos = append(infos, m)
+		}
 	}
 
 	threshold, staleDays := compactionSettings()
@@ -313,8 +354,17 @@ func compactGroupsForSpace(space string) ([][]store.MemoryCentroid, error) {
 	}
 	var groups [][]store.MemoryCentroid
 	for _, idxs := range byRoot {
-		if len(idxs) == 1 && infos[idxs[0]].LastUpdated.After(staleCutoff) {
-			continue // neither similar to a sibling nor stale: leave alone
+		if len(idxs) == 1 {
+			m := infos[idxs[0]]
+			flaggedBad := m.Flag == "stale" || m.Flag == "wrong"
+			stale := !m.LastUpdated.After(staleCutoff)
+			// "useful" protects against age-based pruning alone (it's not
+			// grouped here anyway, since len==1 means no similar sibling
+			// pulled it in); "stale"/"wrong" make a memory a candidate
+			// regardless of age.
+			if m.Flag == "useful" || (!stale && !flaggedBad) {
+				continue // neither similar to a sibling, stale, nor flagged stale/wrong
+			}
 		}
 		g := make([]store.MemoryCentroid, len(idxs))
 		for k, idx := range idxs {
@@ -338,7 +388,14 @@ func compactGroup(space string, g []store.MemoryCentroid, dryRun bool) (string, 
 	if dryRun {
 		reason := "similar"
 		if len(g) == 1 {
-			reason = "stale"
+			switch g[0].Flag {
+			case "wrong":
+				reason = "flagged wrong"
+			case "stale":
+				reason = "flagged stale"
+			default:
+				reason = "stale"
+			}
 		}
 		return fmt.Sprintf("space %q: [%s] -> would merge into %q (%s)", space, strings.Join(names, ", "), newName, reason), nil
 	}
@@ -360,7 +417,16 @@ func compactGroup(space string, g []store.MemoryCentroid, dryRun bool) (string, 
 	if merged == "" {
 		return "", fmt.Errorf("ollama returned an empty summary")
 	}
-	if _, err := st.SaveMemory(space, newName, merged); err != nil {
+	// A solo re-summarization keeps its source/kind; a multi-source merge
+	// has no single rightful owner, so it's recorded as DefaultSource and,
+	// since it's now a synthesized note rather than any one original
+	// memory's structured type, DefaultKind (decisions are already
+	// excluded from grouping above, so this never demotes one).
+	mergedSource, mergedKind := store.DefaultSource, store.DefaultKind
+	if len(g) == 1 {
+		mergedSource, mergedKind = g[0].Source, g[0].Kind
+	}
+	if _, err := st.SaveMemory(space, newName, merged, mergedSource, mergedKind); err != nil {
 		return "", err
 	}
 	for _, m := range g {
@@ -381,14 +447,35 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		n, _ := args["name"].(string)
 		content, _ := args["content"].(string)
 		space := argSpace(args)
+		source, _ := args["source"].(string)
+		if source == "" {
+			source = store.DefaultSource
+		}
+		kind, _ := args["kind"].(string)
+		if kind == "" {
+			kind = store.DefaultKind
+		}
 		if n == "" || content == "" {
 			return errResult("name and content are required")
 		}
-		numChunks, err := st.SaveMemory(space, n, content)
+		if !store.IsValidKind(kind) {
+			return errResult(fmt.Sprintf("invalid kind %q, want one of: %s", kind, validKindsList()))
+		}
+		var numChunks int
+		var err error
+		if expectSource, _ := args["expect_source"].(string); expectSource != "" {
+			numChunks, err = st.SaveMemoryExpectSource(space, n, content, source, kind, expectSource)
+			var conflict *store.SourceConflictError
+			if errors.As(err, &conflict) {
+				return errResult(fmt.Sprintf("memory %q in space %q already exists with source %q, not %q — refusing to overwrite", n, space, conflict.Existing, expectSource))
+			}
+		} else {
+			numChunks, err = st.SaveMemory(space, n, content, source, kind)
+		}
 		if err != nil {
 			return internalErr("save_memory", err)
 		}
-		return textResult(fmt.Sprintf("saved memory %q in space %q (%d bytes, %d chunk(s))", n, space, len(content), numChunks))
+		return textResult(fmt.Sprintf("saved memory %q in space %q (source %q, kind %q, %d bytes, %d chunk(s))", n, space, source, kind, len(content), numChunks))
 
 	case "get_memory":
 		n, _ := args["name"].(string)
@@ -403,8 +490,10 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		return textResult(content)
 
 	case "list_memories":
+		sourceFilter, _ := args["source"].(string)
+		kindFilter, _ := args["kind"].(string)
 		if s, ok := args["space"].(string); ok && s != "" {
-			names, err := st.ListMemoryNames(s)
+			names, err := st.ListMemoryNames(s, sourceFilter, kindFilter)
 			if err != nil {
 				return internalErr("list_memories query", err)
 			}
@@ -414,7 +503,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			return textResult(strings.Join(names, "\n"))
 		}
 
-		all, err := st.ListAll()
+		all, err := st.ListAll(sourceFilter, kindFilter)
 		if err != nil {
 			return internalErr("list_memories query", err)
 		}
@@ -445,7 +534,9 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		if limit > 20 {
 			limit = 20
 		}
-		matches, err := st.SearchMemories(space, q, limit, searchWeights())
+		sourceFilter, _ := args["source"].(string)
+		kindFilter, _ := args["kind"].(string)
+		matches, err := st.SearchMemories(space, q, limit, searchWeights(), sourceFilter, kindFilter)
 		if err != nil {
 			return internalErr("search_memories", err)
 		}
@@ -469,6 +560,26 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			return errResult(fmt.Sprintf("memory %q not found in space %q", n, space))
 		}
 		return textResult(fmt.Sprintf("deleted memory %q from space %q", n, space))
+
+	case "flag_memory":
+		n, _ := args["name"].(string)
+		space := argSpace(args)
+		flag, _ := args["flag"].(string)
+		note, _ := args["note"].(string)
+		if n == "" || flag == "" {
+			return errResult("name and flag are required")
+		}
+		if !store.IsValidFlag(flag) {
+			return errResult(fmt.Sprintf("invalid flag %q, want one of: %s", flag, validFlagsList()))
+		}
+		found, err := st.FlagMemory(space, n, flag, note)
+		if err != nil {
+			return internalErr("flag_memory", err)
+		}
+		if !found {
+			return errResult(fmt.Sprintf("memory %q not found in space %q", n, space))
+		}
+		return textResult(fmt.Sprintf("flagged memory %q in space %q as %q", n, space, flag))
 
 	case "compact_memories":
 		dryRun := true
@@ -512,9 +623,32 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		}
 		return textResult(fmt.Sprintf("%s %d group(s):\n%s", verb, len(lines), strings.Join(lines, "\n")))
 
+	case "get_session_summary":
+		space := argSpace(args)
+		limit := 15
+		if l, ok := args["limit"].(float64); ok && l > 0 {
+			limit = int(l)
+		}
+		if limit > 50 {
+			limit = 50
+		}
+		recents, err := st.RecentMemories(space, limit)
+		if err != nil {
+			return internalErr("get_session_summary query", err)
+		}
+		if len(recents) == 0 {
+			return textResult(fmt.Sprintf("(no memories yet in space %q)", space))
+		}
+		summary, err := sessionSummaryPrompt(space, recents)
+		if err != nil {
+			return internalErr("get_session_summary chat", err)
+		}
+		return textResult(summary)
+
 	case "export_memories":
 		space, _ := args["space"].(string)
-		items, err := st.Export(space)
+		source, _ := args["source"].(string)
+		items, err := st.Export(space, source)
 		if err != nil {
 			return internalErr("export_memories", err)
 		}
@@ -534,8 +668,9 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			return errResult("data is not valid export JSON: " + err.Error())
 		}
 		spaceOverride, _ := args["space"].(string)
+		sourceOverride, _ := args["source"].(string)
 		overwrite, _ := args["overwrite"].(bool)
-		res, err := st.Import(items, spaceOverride, overwrite)
+		res, err := st.Import(items, spaceOverride, sourceOverride, overwrite)
 		if err != nil {
 			return internalErr("import_memories", err)
 		}
@@ -565,7 +700,7 @@ func resourceURI(space, name string) string {
 var errNotFound = fmt.Errorf("not found")
 
 func listResources() (interface{}, error) {
-	all, err := st.ListAll()
+	all, err := st.ListAll("", "")
 	if err != nil {
 		log.Printf("resources/list query: %v", err)
 		return nil, fmt.Errorf("internal error")
@@ -616,7 +751,7 @@ func handle(req request) *response {
 				"tools":     map[string]interface{}{},
 				"resources": map[string]interface{}{},
 			},
-			"serverInfo": map[string]string{"name": "memory-vault", "version": "0.7.0"},
+			"serverInfo": map[string]string{"name": "memory-vault", "version": "0.8.0"},
 		})
 
 	case "notifications/initialized":
@@ -772,9 +907,10 @@ func mcpHandler(w http.ResponseWriter, r *http.Request) {
 func runExportCLI(args []string) {
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
 	space := fs.String("space", "", "space to export (all spaces if omitted)")
+	source := fs.String("source", "", "source to export (all sources if omitted)")
 	fs.Parse(args)
 
-	items, err := st.Export(*space)
+	items, err := st.Export(*space, *source)
 	if err != nil {
 		log.Fatalf("export: %v", err)
 	}
@@ -789,6 +925,7 @@ func runImportCLI(args []string) {
 	fs := flag.NewFlagSet("import", flag.ExitOnError)
 	file := fs.String("file", "", "JSON file to import (reads stdin if omitted)")
 	space := fs.String("space", "", "send every imported memory to this space, overriding what's in the data")
+	source := fs.String("source", "", "send every imported memory to this source, overriding what's in the data")
 	overwrite := fs.Bool("overwrite", false, "overwrite existing (space, name) pairs instead of skipping them")
 	fs.Parse(args)
 
@@ -805,7 +942,7 @@ func runImportCLI(args []string) {
 	if err := json.NewDecoder(r).Decode(&items); err != nil {
 		log.Fatalf("import: invalid JSON: %v", err)
 	}
-	res, err := st.Import(items, *space, *overwrite)
+	res, err := st.Import(items, *space, *source, *overwrite)
 	if err != nil {
 		log.Fatalf("import: %v", err)
 	}

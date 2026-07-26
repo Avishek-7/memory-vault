@@ -77,19 +77,56 @@ client at `http://localhost:8080/mcp` (see
 
 | Tool | Description |
 |---|---|
-| `save_memory` | Create or overwrite a memory by name. Chunks and embeds the content for semantic search. |
+| `save_memory` | Create or overwrite a memory by name. Chunks and embeds the content for semantic search. Optional `source` records who wrote it; optional `expect_source` rejects the write instead of overwriting if it collides with a different source. Optional `kind` (default `note`) is one of `fact`, `decision`, `preference`, `task`, `note`. |
 | `get_memory` | Fetch a memory's content by exact name. |
-| `list_memories` | List stored memory names. |
-| `search_memories` | Hybrid (semantic + keyword + recency) search, top `limit` matches (default 5, max 20). |
+| `list_memories` | List stored memory names. Optional `source`/`kind` filters. |
+| `search_memories` | Hybrid (semantic + keyword + recency + optional per-kind boost) search, top `limit` matches (default 5, max 20). Optional `source`/`kind` filters. |
 | `delete_memory` | Delete a memory by name. |
-| `compact_memories` | Merge/summarize near-duplicate or stale memories via the local Ollama chat model. |
-| `export_memories` | Export memories as JSON (no embeddings). Optional `space`; omit it to export everything. |
-| `import_memories` | Import memories from JSON in the shape `export_memories` produces. Re-chunks/re-embeds through the normal save path. |
+| `flag_memory` | Set a usage/quality flag (`useful`, `stale`, or `wrong`) on a memory, with an optional `note`. Overwrites any previous flag — one current flag per memory, not a history. Influences `compact_memories` candidate selection. |
+| `compact_memories` | Merge/summarize near-duplicate or stale memories via the local Ollama chat model. Never selects `decision`-kind memories. |
+| `get_session_summary` | Read-only resume of a space's recent state (what's current, decided, open, likely next) via the local Ollama chat model. Use this to pick up broad context after a session/context reset; use `search_memories` to find one specific fact instead. Optional `limit` (default 15, max 50). |
+| `export_memories` | Export memories as JSON (no embeddings). Optional `space`/`source`; omit both to export everything. |
+| `import_memories` | Import memories from JSON in the shape `export_memories` produces. Re-chunks/re-embeds through the normal save path. Optional `space`/`source` overrides. |
 
 All tools accept an optional `space` argument (default `"default"`) to
 namespace memories — the same `name` can exist independently in different
 spaces. `list_memories` without a `space` lists everything grouped by
 space; with one, it lists just that space's memory names.
+
+## Multiple agents writing to the same vault
+
+Every memory also carries a `source` — a free-form string naming whichever
+agent wrote it (e.g. `"claude-code"`, `"copilot"`, `"n8n"`), defaulting to
+`"unspecified"` if you don't pass one. It's **provenance and
+collision-avoidance, not an access boundary**: anyone with a valid
+`AUTH_TOKEN` can still read or write any source's memories in any space
+they can reach. What it does buy you is protection against silent
+same-name clobbering — pass `expect_source` on `save_memory` and the write
+is rejected (naming the existing source) instead of silently overwriting
+a memory a different agent wrote under that name. Omit `expect_source` and
+`save_memory` overwrites unconditionally, exactly as before this field
+existed. If you want real isolation between agents, use separate `space`s
+instead — spaces are the actual boundary here.
+
+## Kinds
+
+Every memory also carries a `kind`, one of:
+
+| Kind | For |
+|---|---|
+| `fact` | Something true and largely static (a config value, an account detail) |
+| `decision` | Something explicitly decided — an architecture choice, a "we're doing X not Y" |
+| `preference` | How the user/agent wants things done, independent of any one task |
+| `task` | Something in progress or still to do |
+| `note` | Everything else — the default |
+
+It defaults to `note` if omitted, and is validated at the tool boundary —
+an unrecognized value is rejected with the list of valid ones, rather than
+failing deep in a database error. `search_memories` can optionally boost
+matches of a given kind above others at equal similarity via
+`SEARCH_KIND_BOOST_<KIND>` env vars (all default to `0`, so ranking is
+unchanged unless you opt in). See [Compaction](#compaction) for how `kind`
+affects `compact_memories`.
 
 ## Compaction
 
@@ -111,10 +148,44 @@ manual/on-demand — there's no background cron. If you want it to run
 automatically, wire a periodic call to the tool into a cron job or an
 n8n/similar workflow.
 
+**Memories of kind `decision` are never compaction candidates** — they're
+excluded before grouping, so a decision can neither be merged into another
+memory nor picked up by staleness pruning, no matter how old or similar to
+something else it is. If you want a decision reconsidered or superseded,
+do that explicitly (`save_memory` a new one, `delete_memory` the old one)
+rather than relying on compaction to do it for you.
+
+**`flag_memory` shifts candidate selection beyond age/similarity alone.**
+A memory flagged `stale` or `wrong` becomes a compaction candidate
+regardless of how recently it was updated (`compact_memories`'s dry-run
+plan says why: "flagged stale"/"flagged wrong" instead of just "stale"). A
+memory flagged `useful` is protected from age-based selection — being old
+alone won't pull it in — but it can still be grouped into a merge if it's a
+genuine near-duplicate by embedding similarity; `useful` guards against
+"nobody's touched this in 90 days" pruning, not against real dedup. A
+flag survives a later `save_memory` overwrite of that same memory (editing
+content doesn't retroactively undo a quality judgment) — only another
+`flag_memory` call changes it.
+
+## Resuming a session
+
+`get_session_summary` is a different tool from `search_memories`, for a
+different job: **resuming broad context, not finding one fact.** Pull the
+most-recently-updated memories in a space (favoring `task`/`decision` kind,
+since those represent state rather than static facts), send them to the
+local Ollama chat model, and ask for a short resume — current state, what
+was decided, what's still open, likely next step. It's read-only; it never
+writes anything. Use `search_memories` when you know roughly what you're
+looking for ("what did we decide about auth timeouts"); use
+`get_session_summary` when you're picking a space back up after a context
+reset and want the gist before diving in. If the stored memories don't
+clearly imply a next step, the prompt instructs the model to say so rather
+than invent one.
+
 ## Export / import
 
-`export_memories` returns a JSON array of `{name, space, content,
-updated_at}` — no embeddings, since they're cheap to regenerate on import
+`export_memories` returns a JSON array of `{name, space, source, kind,
+content, updated_at}` — no embeddings, since they're cheap to regenerate on import
 and including them would tie the export to whatever embedding
 model/dimension was active when it was taken. `import_memories` takes
 that same JSON (as its `data` argument) and re-chunks/re-embeds every
@@ -124,7 +195,8 @@ whatever `Embedder` is currently configured. By default it skips
 skipped; pass `overwrite: true` to replace them instead. An optional
 `space` argument sends every imported memory there regardless of what's
 recorded in the data — useful for merging a backup into a differently
-named space.
+named space; `source` works the same way (an export taken before the
+`source` field existed imports as `"unspecified"` unless overridden).
 
 Both are also available as CLI subcommands on the `memory-vault` binary
 itself, for scripting a backup without going through an MCP client:
@@ -137,8 +209,9 @@ memory-vault import --file backup.json
 
 `export`/`import` need the same `DATABASE_URL` (and `OLLAMA_URL` or
 `EMBED_PROVIDER=openai` config, for `import`'s re-embedding) as the
-server itself. `import --space other-space --overwrite` mirrors the
-tool's `space`/`overwrite` arguments.
+server itself. `import --space other-space --source other-source
+--overwrite` mirrors the tool's `space`/`source`/`overwrite` arguments;
+`export --source` filters the same way.
 
 ## Browsing memories
 
@@ -161,8 +234,9 @@ OLLAMA_URL="http://localhost:11434" \
 | `↑`/`k`, `↓`/`j` | Move selection |
 | `/` | Semantic search within the current space |
 | `e` | Edit the selected memory in `$EDITOR` (falls back to `nvim`); saves and re-embeds on exit |
-| `n` | Create a new memory: prompts for name and space, then opens `$EDITOR` for content |
+| `n` | Create a new memory: prompts for name, space, source (default `unspecified`), and kind (default `note`, re-prompts on an invalid value), then opens `$EDITOR` for content |
 | `d` | Delete the selected memory (confirm with `y`) |
+| `s` | Show a `get_session_summary` resume for the current space in the content pane |
 | `esc` | Back out of search results / a prompt |
 | `q` | Quit |
 
@@ -208,6 +282,7 @@ Environment variables:
 | `SEARCH_WEIGHT_KEYWORD` | `0.0` | Weight of full-text (`ts_rank`) similarity |
 | `SEARCH_WEIGHT_RECENCY` | `0.0` | Weight of recency (exponential decay by `updated_at`) |
 | `SEARCH_RECENCY_HALFLIFE_DAYS` | `30` | Half-life, in days, for the recency decay factor |
+| `SEARCH_KIND_BOOST_FACT`, `_DECISION`, `_PREFERENCE`, `_TASK`, `_NOTE` | `0` each | Flat score boost added to matches of that kind in `search_memories` |
 | `COMPACT_SIMILARITY_THRESHOLD` | `0.15` | Cosine-distance threshold under which two memories' embeddings are treated as near-duplicates by `compact_memories` |
 | `COMPACT_STALE_DAYS` | `90` | Age (in days since `updated_at`) past which a lone memory is still a `compact_memories` candidate for solo re-summarization |
 
