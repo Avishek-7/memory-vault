@@ -177,6 +177,28 @@ func ollamaChat(prompt string) (string, error) {
 	return out.Message.Content, nil
 }
 
+// sessionSummaryPrompt builds a resume prompt from a space's recent
+// memories and sends it through ollamaChat (the same call path
+// compact_memories uses — no separate HTTP logic here).
+func sessionSummaryPrompt(space string, recents []store.RecentMemory) (string, error) {
+	var parts []string
+	for _, m := range recents {
+		parts = append(parts, fmt.Sprintf("--- %s (kind: %s, updated %s) ---\n%s", m.Name, m.Kind, m.UpdatedAt.Format(time.RFC3339), m.Content))
+	}
+	prompt := fmt.Sprintf(`The following are the most recently updated memories from space %q, most state-carrying (task/decision) ones first. Based only on what's here, write a short resume covering: what's the current state, what was decided, what's still open, and what's the likely next step. If the memories don't clearly imply a next step, say "unclear from stored memories" rather than inventing one.
+
+%s`, space, strings.Join(parts, "\n\n"))
+	summary, err := ollamaChat(prompt)
+	if err != nil {
+		return "", err
+	}
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		return "", fmt.Errorf("ollama returned an empty summary")
+	}
+	return summary, nil
+}
+
 // --- JSON-RPC plumbing ---
 
 type request struct {
@@ -254,6 +276,11 @@ var tools = []tool{
 		Name:        "export_memories",
 		Description: "Export memories as JSON (name, space, source, kind, content, updated_at — no embeddings, which are cheap to regenerate on import). Optional space exports just that space; optional source exports just that source; omit both to export everything.",
 		InputSchema: schema(nil, map[string]string{"space": "string", "source": "string"}),
+	},
+	{
+		Name:        "get_session_summary",
+		Description: "Read-only resume of a space's recent state (default space: \"default\") for picking up work after a new session/context reset: what's the current state, what was decided, what's still open, likely next step. Summarizes the most recently updated memories (favoring task/decision kind) via the local Ollama chat model. Use this to resume broad context; use search_memories to find one specific fact instead. Optional limit caps how many recent memories it considers (default 15, max 50).",
+		InputSchema: schema(nil, map[string]string{"space": "string", "limit": "number"}),
 	},
 	{
 		Name:        "import_memories",
@@ -622,6 +649,28 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			verb = "compacted"
 		}
 		return textResult(fmt.Sprintf("%s %d group(s):\n%s", verb, len(lines), strings.Join(lines, "\n")))
+
+	case "get_session_summary":
+		space := argSpace(args)
+		limit := 15
+		if l, ok := args["limit"].(float64); ok && l > 0 {
+			limit = int(l)
+		}
+		if limit > 50 {
+			limit = 50
+		}
+		recents, err := st.RecentMemories(space, limit)
+		if err != nil {
+			return internalErr("get_session_summary query", err)
+		}
+		if len(recents) == 0 {
+			return textResult(fmt.Sprintf("(no memories yet in space %q)", space))
+		}
+		summary, err := sessionSummaryPrompt(space, recents)
+		if err != nil {
+			return internalErr("get_session_summary chat", err)
+		}
+		return textResult(summary)
 
 	case "export_memories":
 		space, _ := args["space"].(string)

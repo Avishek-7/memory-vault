@@ -670,6 +670,55 @@ func (s *Store) MemoryCentroids(space string) ([]MemoryCentroid, error) {
 	return out, rows.Err()
 }
 
+// RecentMemory is one memory as surfaced by RecentMemories: its reassembled
+// content plus enough metadata to explain why it was picked.
+type RecentMemory struct {
+	Name      string
+	Kind      string
+	Content   string
+	UpdatedAt time.Time
+}
+
+// RecentMemories returns up to limit of the most-recently-updated memories
+// in a space, for get_session_summary's "what was I doing here" resume.
+// task/decision-kind memories are ranked first among equally-recent ones,
+// since they represent state (what's in progress, what was decided) rather
+// than static facts.
+func (s *Store) RecentMemories(space string, limit int) ([]RecentMemory, error) {
+	rows, err := s.DB.Query(`
+		SELECT name, max(kind) AS kind, max(updated_at) AS updated_at
+		FROM memories
+		WHERE space = $1
+		GROUP BY name
+		ORDER BY (max(kind) IN ('task', 'decision')) DESC, updated_at DESC
+		LIMIT $2
+	`, space, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RecentMemory
+	for rows.Next() {
+		var name, kind string
+		var updatedAt time.Time
+		if err := rows.Scan(&name, &kind, &updatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, RecentMemory{Name: name, Kind: kind, UpdatedAt: updatedAt})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		content, err := s.Reassemble(space, out[i].Name)
+		if err != nil {
+			return nil, err
+		}
+		out[i].Content = content
+	}
+	return out, nil
+}
+
 // MemoryExport is one memory's portable representation: no embeddings
 // (cheap to regenerate on Import, and including them would tie the
 // export to a specific embedding model/dimension).

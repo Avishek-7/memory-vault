@@ -4,7 +4,10 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
@@ -75,6 +78,37 @@ func storeConfig() (store.Config, error) {
 
 func editor() string { return envOr("EDITOR", "nvim") }
 
+// ollamaChatModel/ollamaChat mirror main.go's compact_memories call path,
+// duplicated here (not shared via internal/store) since the TUI is a
+// standalone binary that otherwise never talks to the Ollama chat API —
+// same pattern as this file's own embedderFromEnv/storeConfig duplication.
+func ollamaChatModel() string { return envOr("OLLAMA_CHAT_MODEL", "llama3.1:8b") }
+
+func ollamaChat(prompt string) (string, error) {
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"model":    ollamaChatModel(),
+		"messages": []map[string]string{{"role": "user", "content": prompt}},
+		"stream":   false,
+	})
+	resp, err := http.Post(envOr("OLLAMA_URL", "http://localhost:11434")+"/api/chat", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("ollama chat request failed (is Ollama running with %q pulled?): %w", ollamaChatModel(), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ollama chat returned status %d", resp.StatusCode)
+	}
+	var out struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	return out.Message.Content, nil
+}
+
 // --- styling: monochrome-friendly, borders/bold over color ---
 
 var (
@@ -137,6 +171,10 @@ type mutateDoneMsg struct {
 type editDoneMsg struct {
 	space, name, content string
 	err                  error
+}
+type sessionSummaryDoneMsg struct {
+	content string
+	err     error
 }
 
 // --- model ---
@@ -215,6 +253,37 @@ func deleteCmd(st *store.Store, space, name string) tea.Cmd {
 	return func() tea.Msg {
 		_, err := st.DeleteMemory(space, name)
 		return mutateDoneMsg{status: fmt.Sprintf("deleted %q from space %q", name, space), err: err}
+	}
+}
+
+// sessionSummaryCmd builds get_session_summary's resume prompt from a
+// space's most-recently-updated memories and sends it through ollamaChat.
+// Read-only — writes nothing.
+func sessionSummaryCmd(st *store.Store, space string) tea.Cmd {
+	return func() tea.Msg {
+		recents, err := st.RecentMemories(space, 15)
+		if err != nil {
+			return sessionSummaryDoneMsg{err: err}
+		}
+		if len(recents) == 0 {
+			return sessionSummaryDoneMsg{content: fmt.Sprintf("(no memories yet in space %q)", space)}
+		}
+		var parts []string
+		for _, m := range recents {
+			parts = append(parts, fmt.Sprintf("--- %s (kind: %s, updated %s) ---\n%s", m.Name, m.Kind, m.UpdatedAt.Format(time.RFC3339), m.Content))
+		}
+		prompt := fmt.Sprintf(`The following are the most recently updated memories from space %q, most state-carrying (task/decision) ones first. Based only on what's here, write a short resume covering: what's the current state, what was decided, what's still open, and what's the likely next step. If the memories don't clearly imply a next step, say "unclear from stored memories" rather than inventing one.
+
+%s`, space, strings.Join(parts, "\n\n"))
+		summary, err := ollamaChat(prompt)
+		if err != nil {
+			return sessionSummaryDoneMsg{err: err}
+		}
+		summary = strings.TrimSpace(summary)
+		if summary == "" {
+			return sessionSummaryDoneMsg{err: fmt.Errorf("ollama returned an empty summary")}
+		}
+		return sessionSummaryDoneMsg{content: summary}
 	}
 }
 
@@ -348,6 +417,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = msg.status
 		m.mode = modeBrowse
 		return m, loadRowsCmd(m.st)
+
+	case sessionSummaryDoneMsg:
+		m.statusErr = msg.err != nil
+		if msg.err != nil {
+			m.status = "session summary: " + msg.err.Error()
+			return m, nil
+		}
+		m.content = msg.content
+		m.viewport.SetContent(msg.content)
+		m.viewport.GotoTop()
+		m.status = fmt.Sprintf("session summary for space %q", m.currentSpace)
+		return m, nil
 
 	case editDoneMsg:
 		m.statusErr = msg.err != nil
@@ -494,6 +575,10 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.mode = modeConfirmDelete
 			}
 			return m, nil
+		case "s":
+			m.status = fmt.Sprintf("generating session summary for space %q...", m.currentSpace)
+			m.statusErr = false
+			return m, sessionSummaryCmd(m.st, m.currentSpace)
 		}
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
@@ -555,7 +640,7 @@ func (m model) View() string {
 		if m.statusErr {
 			status = "error: " + status
 		}
-		keys := dimStyle.Render("/ search   e edit   n new   d delete   q quit")
+		keys := dimStyle.Render("/ search   e edit   n new   d delete   s summary   q quit")
 		if status != "" {
 			bottom = status + "   " + keys
 		} else {

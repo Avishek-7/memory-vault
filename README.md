@@ -84,6 +84,7 @@ client at `http://localhost:8080/mcp` (see
 | `delete_memory` | Delete a memory by name. |
 | `flag_memory` | Set a usage/quality flag (`useful`, `stale`, or `wrong`) on a memory, with an optional `note`. Overwrites any previous flag — one current flag per memory, not a history. Influences `compact_memories` candidate selection. |
 | `compact_memories` | Merge/summarize near-duplicate or stale memories via the local Ollama chat model. Never selects `decision`-kind memories. |
+| `get_session_summary` | Read-only resume of a space's recent state (what's current, decided, open, likely next) via the local Ollama chat model. Use this to pick up broad context after a session/context reset; use `search_memories` to find one specific fact instead. Optional `limit` (default 15, max 50). |
 | `export_memories` | Export memories as JSON (no embeddings). Optional `space`/`source`; omit both to export everything. |
 | `import_memories` | Import memories from JSON in the shape `export_memories` produces. Re-chunks/re-embeds through the normal save path. Optional `space`/`source` overrides. |
 
@@ -163,6 +164,21 @@ alone won't pull it in — but it can still be grouped into a merge if it's a
 genuine near-duplicate by embedding similarity; `useful` guards against
 "nobody's touched this in 90 days" pruning, not against real dedup.
 
+## Resuming a session
+
+`get_session_summary` is a different tool from `search_memories`, for a
+different job: **resuming broad context, not finding one fact.** Pull the
+most-recently-updated memories in a space (favoring `task`/`decision` kind,
+since those represent state rather than static facts), send them to the
+local Ollama chat model, and ask for a short resume — current state, what
+was decided, what's still open, likely next step. It's read-only; it never
+writes anything. Use `search_memories` when you know roughly what you're
+looking for ("what did we decide about auth timeouts"); use
+`get_session_summary` when you're picking a space back up after a context
+reset and want the gist before diving in. If the stored memories don't
+clearly imply a next step, the prompt instructs the model to say so rather
+than invent one.
+
 ## Export / import
 
 `export_memories` returns a JSON array of `{name, space, source, kind,
@@ -217,6 +233,7 @@ OLLAMA_URL="http://localhost:11434" \
 | `e` | Edit the selected memory in `$EDITOR` (falls back to `nvim`); saves and re-embeds on exit |
 | `n` | Create a new memory: prompts for name, space, source (default `unspecified`), and kind (default `note`, re-prompts on an invalid value), then opens `$EDITOR` for content |
 | `d` | Delete the selected memory (confirm with `y`) |
+| `s` | Show a `get_session_summary` resume for the current space in the content pane |
 | `esc` | Back out of search results / a prompt |
 | `q` | Quit |
 
