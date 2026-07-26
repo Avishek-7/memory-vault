@@ -162,7 +162,10 @@ plan says why: "flagged stale"/"flagged wrong" instead of just "stale"). A
 memory flagged `useful` is protected from age-based selection — being old
 alone won't pull it in — but it can still be grouped into a merge if it's a
 genuine near-duplicate by embedding similarity; `useful` guards against
-"nobody's touched this in 90 days" pruning, not against real dedup.
+"nobody's touched this in 90 days" pruning, not against real dedup. A
+flag survives a later `save_memory` overwrite of that same memory (editing
+content doesn't retroactively undo a quality judgment) — only another
+`flag_memory` call changes it.
 
 ## Resuming a session
 

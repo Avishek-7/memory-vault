@@ -5,7 +5,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -21,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"memory-vault/internal/chat"
 	"memory-vault/internal/embed"
 	"memory-vault/internal/store"
 )
@@ -151,44 +151,17 @@ func argSpace(args map[string]interface{}) string {
 }
 
 // ollamaChat sends a single-turn prompt to the local Ollama chat model and
-// returns its response text. Used only by compact_memories, never search/save.
+// returns its response text. Used by compact_memories and
+// get_session_summary, never search/save.
 func ollamaChat(prompt string) (string, error) {
-	reqBody, _ := json.Marshal(map[string]interface{}{
-		"model":    ollamaChatModel(),
-		"messages": []map[string]string{{"role": "user", "content": prompt}},
-		"stream":   false,
-	})
-	resp, err := http.Post(ollamaURL()+"/api/chat", "application/json", bytes.NewReader(reqBody))
-	if err != nil {
-		return "", fmt.Errorf("ollama chat request failed (is Ollama running with %q pulled?): %w", ollamaChatModel(), err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("ollama chat returned status %d", resp.StatusCode)
-	}
-	var out struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
-	}
-	return out.Message.Content, nil
+	return chat.Chat(ollamaURL(), ollamaChatModel(), prompt)
 }
 
 // sessionSummaryPrompt builds a resume prompt from a space's recent
-// memories and sends it through ollamaChat (the same call path
-// compact_memories uses — no separate HTTP logic here).
+// memories (via the shared internal/chat template, so the TUI's "s"
+// keybinding can't drift out of sync) and sends it through ollamaChat.
 func sessionSummaryPrompt(space string, recents []store.RecentMemory) (string, error) {
-	var parts []string
-	for _, m := range recents {
-		parts = append(parts, fmt.Sprintf("--- %s (kind: %s, updated %s) ---\n%s", m.Name, m.Kind, m.UpdatedAt.Format(time.RFC3339), m.Content))
-	}
-	prompt := fmt.Sprintf(`The following are the most recently updated memories from space %q, most state-carrying (task/decision) ones first. Based only on what's here, write a short resume covering: what's the current state, what was decided, what's still open, and what's the likely next step. If the memories don't clearly imply a next step, say "unclear from stored memories" rather than inventing one.
-
-%s`, space, strings.Join(parts, "\n\n"))
-	summary, err := ollamaChat(prompt)
+	summary, err := ollamaChat(chat.SessionSummaryPrompt(space, recents))
 	if err != nil {
 		return "", err
 	}

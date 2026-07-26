@@ -4,10 +4,7 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
@@ -19,6 +16,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"memory-vault/internal/chat"
 	"memory-vault/internal/embed"
 	"memory-vault/internal/store"
 )
@@ -78,36 +76,7 @@ func storeConfig() (store.Config, error) {
 
 func editor() string { return envOr("EDITOR", "nvim") }
 
-// ollamaChatModel/ollamaChat mirror main.go's compact_memories call path,
-// duplicated here (not shared via internal/store) since the TUI is a
-// standalone binary that otherwise never talks to the Ollama chat API —
-// same pattern as this file's own embedderFromEnv/storeConfig duplication.
 func ollamaChatModel() string { return envOr("OLLAMA_CHAT_MODEL", "llama3.1:8b") }
-
-func ollamaChat(prompt string) (string, error) {
-	reqBody, _ := json.Marshal(map[string]interface{}{
-		"model":    ollamaChatModel(),
-		"messages": []map[string]string{{"role": "user", "content": prompt}},
-		"stream":   false,
-	})
-	resp, err := http.Post(envOr("OLLAMA_URL", "http://localhost:11434")+"/api/chat", "application/json", bytes.NewReader(reqBody))
-	if err != nil {
-		return "", fmt.Errorf("ollama chat request failed (is Ollama running with %q pulled?): %w", ollamaChatModel(), err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("ollama chat returned status %d", resp.StatusCode)
-	}
-	var out struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
-	}
-	return out.Message.Content, nil
-}
 
 // --- styling: monochrome-friendly, borders/bold over color ---
 
@@ -268,14 +237,8 @@ func sessionSummaryCmd(st *store.Store, space string) tea.Cmd {
 		if len(recents) == 0 {
 			return sessionSummaryDoneMsg{content: fmt.Sprintf("(no memories yet in space %q)", space)}
 		}
-		var parts []string
-		for _, m := range recents {
-			parts = append(parts, fmt.Sprintf("--- %s (kind: %s, updated %s) ---\n%s", m.Name, m.Kind, m.UpdatedAt.Format(time.RFC3339), m.Content))
-		}
-		prompt := fmt.Sprintf(`The following are the most recently updated memories from space %q, most state-carrying (task/decision) ones first. Based only on what's here, write a short resume covering: what's the current state, what was decided, what's still open, and what's the likely next step. If the memories don't clearly imply a next step, say "unclear from stored memories" rather than inventing one.
-
-%s`, space, strings.Join(parts, "\n\n"))
-		summary, err := ollamaChat(prompt)
+		prompt := chat.SessionSummaryPrompt(space, recents)
+		summary, err := chat.Chat(envOr("OLLAMA_URL", "http://localhost:11434"), ollamaChatModel(), prompt)
 		if err != nil {
 			return sessionSummaryDoneMsg{err: err}
 		}
@@ -508,7 +471,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.status = fmt.Sprintf("invalid kind %q, want one of: %s", kind, strings.Join(store.ValidKinds, ", "))
 					m.statusErr = true
 					m.input.SetValue("")
-					return m, nil // stay in modeNewKind, re-prompt
+					m.input.Focus() // Enter always Blur()s above; re-focus so the re-prompt still accepts keystrokes
+					return m, nil   // stay in modeNewKind, re-prompt
 				}
 				m.mode = modeNewContent
 				return m, editCmd(m.st, m.newSpace, m.newName, "", m.newSource, kind)

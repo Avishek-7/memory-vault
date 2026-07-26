@@ -378,6 +378,20 @@ func isUniqueViolation(err error) bool {
 // nothing.
 func (s *Store) saveMemory(space, name, content, source, kind string, overwrite bool, expectSource string) (wrote bool, chunks int, err error) {
 	chunkList := ChunkContent(content)
+
+	// Embed before opening the transaction: each Embed call is an HTTP
+	// round-trip to Ollama/OpenAI, and doing this inside the tx would hold
+	// the expectSource row lock (below) for the whole embedding pipeline
+	// instead of just the metadata check.
+	vectors := make([]string, len(chunkList))
+	for i, chunk := range chunkList {
+		vec, err := s.Embed(chunk)
+		if err != nil {
+			return false, 0, err
+		}
+		vectors[i] = VectorLiteral(vec)
+	}
+
 	tx, err := s.DB.Begin()
 	if err != nil {
 		return false, 0, err
@@ -395,20 +409,23 @@ func (s *Store) saveMemory(space, name, content, source, kind string, overwrite 
 		}
 	}
 
+	// A content overwrite doesn't invalidate a prior flag_memory judgment
+	// (only flag_memory itself changes it), so carry the existing flag
+	// forward across the delete+reinsert below.
+	var flag, flagNote sql.NullString
+	var flaggedAt sql.NullTime
 	if overwrite {
+		_ = tx.QueryRow(`SELECT flag, flagged_at, flag_note FROM memories WHERE space = $1 AND name = $2 LIMIT 1`, space, name).
+			Scan(&flag, &flaggedAt, &flagNote)
 		if _, err := tx.Exec(`DELETE FROM memories WHERE space = $1 AND name = $2`, space, name); err != nil {
 			return false, 0, err
 		}
 	}
 	for i, chunk := range chunkList {
-		vec, err := s.Embed(chunk)
-		if err != nil {
-			return false, 0, err
-		}
 		_, err = tx.Exec(`
-			INSERT INTO memories (space, name, chunk_index, content, embedding, source, kind, updated_at)
-			VALUES ($1, $2, $3, $4, $5::vector, $6, $7, now())
-		`, space, name, i, chunk, VectorLiteral(vec), source, kind)
+			INSERT INTO memories (space, name, chunk_index, content, embedding, source, kind, flag, flagged_at, flag_note, updated_at)
+			VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $9, $10, now())
+		`, space, name, i, chunk, vectors[i], source, kind, flag, flaggedAt, flagNote)
 		if err != nil {
 			if !overwrite && isUniqueViolation(err) {
 				return false, 0, nil
@@ -690,7 +707,7 @@ func (s *Store) RecentMemories(space string, limit int) ([]RecentMemory, error) 
 		FROM memories
 		WHERE space = $1
 		GROUP BY name
-		ORDER BY (max(kind) IN ('task', 'decision')) DESC, updated_at DESC
+		ORDER BY updated_at DESC, (max(kind) IN ('task', 'decision')) DESC
 		LIMIT $2
 	`, space, limit)
 	if err != nil {
@@ -698,6 +715,7 @@ func (s *Store) RecentMemories(space string, limit int) ([]RecentMemory, error) 
 	}
 	defer rows.Close()
 	var out []RecentMemory
+	names := make([]string, 0)
 	for rows.Next() {
 		var name, kind string
 		var updatedAt time.Time
@@ -705,16 +723,37 @@ func (s *Store) RecentMemories(space string, limit int) ([]RecentMemory, error) 
 			return nil, err
 		}
 		out = append(out, RecentMemory{Name: name, Kind: kind, UpdatedAt: updatedAt})
+		names = append(names, name)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	for i := range out {
-		content, err := s.Reassemble(space, out[i].Name)
-		if err != nil {
+	if len(out) == 0 {
+		return out, nil
+	}
+
+	contentRows, err := s.DB.Query(`
+		SELECT name, content FROM memories
+		WHERE space = $1 AND name = ANY($2)
+		ORDER BY name, chunk_index
+	`, space, pq.Array(names))
+	if err != nil {
+		return nil, err
+	}
+	defer contentRows.Close()
+	contentByName := map[string][]string{}
+	for contentRows.Next() {
+		var name, content string
+		if err := contentRows.Scan(&name, &content); err != nil {
 			return nil, err
 		}
-		out[i].Content = content
+		contentByName[name] = append(contentByName[name], content)
+	}
+	if err := contentRows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].Content = strings.Join(contentByName[out[i].Name], " ")
 	}
 	return out, nil
 }
