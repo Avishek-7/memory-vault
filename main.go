@@ -778,7 +778,7 @@ func handle(req request) *response {
 				"tools":     map[string]interface{}{},
 				"resources": map[string]interface{}{},
 			},
-			"serverInfo": map[string]string{"name": "memory-vault", "version": "0.7.0"},
+			"serverInfo": map[string]string{"name": "memory-vault", "version": "0.8.0"},
 		})
 
 	case "notifications/initialized":
