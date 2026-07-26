@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.9.0
+
+Health-check-based DNS failover to a standby instance, plus a fix to a
+bug found while shipping it. No default behavior changed for normal
+operation — `/healthz` is new and additive; everything else is external
+scripting/ops tooling in `deploy/`.
+
+**`save_memory` multi-chunk fix.** `ChunkContent`'s word-count estimate
+for `all-minilm`'s 256-token budget assumed a words/token ratio that
+doesn't hold for markdown/technical prose (paths, hyphens, numbers
+tokenize denser than plain English) — a chunk could still exceed the
+real token budget and get rejected by Ollama, surfacing as a bare
+internal error. `saveMemory` now detects that rejection
+(`embed.ErrContextLength`) and adaptively splits the offending chunk,
+instead of trusting the word-count estimate to always hold. Lowered the
+chunk target from 150/15 words to 100/10 as a saner default.
+
+**Phase 1 — `GET /healthz`.** New unauthenticated (but still
+`ALLOWED_HOSTS`-gated) endpoint: pings Postgres and returns 200/`{"status":"ok","db":"ok"}`
+or 503/`{"status":"error","db":"unreachable"}`. Checks only Postgres, not
+Ollama — "can this instance serve MCP requests" is a different, more
+urgent question than whether embedding/compaction currently works.
+
+**Phase 2 — `deploy/backup.sh`.** Exports every space via the existing
+export CLI, encrypts with age, and commits+pushes to a configurable
+private git remote (never this repo). Idempotent — hashes the plaintext
+export and skips the commit/push if unchanged, since age's ciphertext
+isn't byte-stable run-to-run. `memory-vault-backup.service`/`.timer`
+(systemd, default hourly) run it unattended.
+
+**Phase 3 — `deploy/standby-sync.sh`.** Pulls the latest backup, decrypts
+it, and imports it with `overwrite: true` into a standby instance's own
+local memory-vault. Tracks the last-synced commit so an unchanged backup
+is a no-op instead of redoing the decrypt/import/re-embed pipeline every
+run. Logs each sync's outcome (synced/skipped/failed, with import
+counts). `memory-vault-standby-sync.service`/`.timer` (systemd, default
+every 15 minutes).
+
+**Phase 4 — `deploy/failover-watch.sh`.** Runs on the standby, polls the
+primary's `/healthz`, and flips a Cloudflare DNS record to the standby's
+IP after `FAILOVER_THRESHOLD` consecutive failures (default 3),
+reverting after `RECOVERY_THRESHOLD` consecutive successes (default 3).
+A cooldown after any flip prevents flapping; an optional
+`NOTIFY_WEBHOOK_URL` fires a JSON payload on every transition. All
+Cloudflare API calls and state transitions fail loudly to the log.
+Ships as a long-running systemd service (`Restart=always`), not a timer
+— sub-minute timer granularity isn't reliable in systemd — with a
+`--once` mode available for anyone who'd rather drive it from cron
+instead.
+
+**Phase 5 — Documentation.** New README "Fallback / failover" section
+covering the design, the explicit DNS-TTL/sync-lag caveats, prerequisites
+(standby host, private backup repo, age key pair, DNS-edit-scoped
+Cloudflare token, low DNS TTL), setup steps, and a full env var table for
+the new tooling — plus an explicit statement that reconciliation after a
+failover window is manual, not automatic bidirectional sync.
+
+`serverInfo.version` bumped to `0.9.0`.
+
 ## 0.8.0
 
 Four scoped additive features for using the vault from multiple agents and
