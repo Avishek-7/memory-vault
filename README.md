@@ -377,8 +377,127 @@ to trigger the pipeline.)
 ## Chunking
 
 `all-minilm` has a 256-token context window. `save_memory` automatically
-splits content longer than ~150 words into overlapping chunks (150-word
-target, 15-word overlap), embeds each chunk separately, and stores them
+splits content longer than ~100 words into overlapping chunks (100-word
+target, 10-word overlap), embeds each chunk separately, and stores them
 under the same memory name. `get_memory` and `search_memories` transparently
 reassemble the full content from its chunks, so long memories no longer
-fail to save.
+fail to save. The word-count target is only an estimate — real token
+density varies with content (markdown/code/paths tokenize denser than
+plain prose) — so if the embedder still rejects a chunk as too long,
+`save_memory` adaptively splits that chunk further and retries, rather
+than trusting the estimate to always hold.
+
+## Fallback / failover
+
+If the host running memory-vault goes down, clients (Claude Desktop,
+Claude Code, Copilot, n8n, or anything else pointed at the same MCP URL)
+can be made to fail over to a standby instance automatically, without
+touching every client's config. The pieces, in order:
+
+1. **Backup** (`deploy/backup.sh`, on the primary): periodically exports
+   every space via the existing `export_memories`/CLI path, encrypts it
+   with [age](https://github.com/FiloSottile/age), and pushes it to a
+   private git repo used only for backups.
+2. **Standby sync** (`deploy/standby-sync.sh`, on the standby): a second,
+   always-on memory-vault instance periodically pulls the latest backup
+   and imports it with `overwrite: true`, so it's never far behind the
+   primary.
+3. **Health-check-based DNS failover** (`deploy/failover-watch.sh`, on the
+   standby): polls the primary's `GET /healthz` (a cheap Postgres ping —
+   see below). After several consecutive failures it flips the Cloudflare
+   DNS record clients use to point at the standby's IP; once the primary
+   is healthy again for several consecutive checks, it flips back.
+
+**Be clear-eyed about what this is and isn't.** This is DNS-based
+failover, not instant failover: it's bounded by the DNS record's TTL and
+whatever clients/resolvers cache on top of that, so expect the switch to
+take effect on the order of the TTL, not immediately. The standby's data
+can also lag the primary by `standby-sync.sh`'s sync interval (15 minutes
+by default) — a write made against the primary in the minutes before it
+went down may not have reached the standby yet. And **there is no
+automatic bidirectional sync**: while DNS points at the standby, writes
+land only there; when the primary comes back, its data does not
+automatically merge with whatever the standby accumulated during the
+outage. Reconciling the two sides is a manual step — decide which
+instance has the data you want to keep (usually the standby, since it was
+the one taking live writes), run `backup.sh` against it, and import that
+into the other side — not something this tooling does for you. This is a
+fallback for read/write continuity during an outage, not a true
+multi-primary setup.
+
+### `GET /healthz`
+
+A plain HTTP endpoint (not an MCP tool), used by `failover-watch.sh` to
+decide whether to fail over. No `AUTH_TOKEN` required — health checkers
+won't carry a bearer token — but it is still subject to `ALLOWED_HOSTS`
+like every other endpoint. It pings Postgres only (`SELECT 1`), not
+Ollama: whether this instance can serve MCP requests at all is a
+different, more urgent question than whether embedding/`compact_memories`
+calls currently work. Returns `{"status":"ok","db":"ok"}` with HTTP 200 on
+success, or a 503 with `{"status":"error","db":"unreachable"}` on
+failure.
+
+### Prerequisites
+
+- A standby host running memory-vault + Postgres/pgvector — `docker-compose.yml`
+  is one way to stand this up; it just needs to be a separate host from
+  the primary, reachable from wherever `failover-watch.sh` runs.
+- A **private** git repo (not this one) to hold encrypted backups.
+- An [age](https://github.com/FiloSottile/age) key pair: the public key
+  (`AGE_RECIPIENT`) goes on the primary for `backup.sh` to encrypt to; the
+  private key (`AGE_IDENTITY`) goes on the standby for `standby-sync.sh`
+  to decrypt with, and nowhere else.
+- A Cloudflare API token scoped to **DNS edit only** on the relevant
+  zone/record — deliberately separate from any existing token used for
+  DNS-01 Let's Encrypt certificate issuance, so a compromised failover
+  token can't touch certificates and vice versa.
+- A **low TTL** on the DNS record `failover-watch.sh` flips, so a flip
+  actually takes effect promptly once triggered — a high TTL makes the
+  whole mechanism much slower than the health-check thresholds suggest.
+
+### Setup
+
+1. On the primary: install `age`, set up `/etc/memory-vault-backup.env`
+   (see `deploy/memory-vault-backup.service`'s header comment for the
+   required variables), then `systemctl enable --now
+   memory-vault-backup.timer`.
+2. On the standby: install `age`, place the age private key somewhere
+   only this service can read, set up
+   `/etc/memory-vault-standby-sync.env`, then `systemctl enable --now
+   memory-vault-standby-sync.timer`.
+3. Also on the standby: set up `/etc/memory-vault-failover.env` with the
+   Cloudflare zone/record/token and the primary/standby IPs, then
+   `systemctl enable --now memory-vault-failover.service` (this one is a
+   long-running service, not a timer — see its unit file's comment for
+   why).
+
+### Configuration (failover tooling)
+
+These are read by the `deploy/*.sh` scripts, not the `memory-vault`
+server binary itself:
+
+| Var | Default | Description |
+|---|---|---|
+| `AGE_RECIPIENT` | *(required)* | One or more age public keys (space-separated) `backup.sh` encrypts backups to |
+| `AGE_IDENTITY` | *(required)* | Path to the age private key file `standby-sync.sh` decrypts backups with |
+| `BACKUP_GIT_REMOTE` | *(required)* | Private git repo backups are pushed to / pulled from (never this repo) |
+| `BACKUP_GIT_DIR` | `/var/lib/memory-vault-backup/repo` (backup.sh) / `/var/lib/memory-vault-backup/standby-repo` (standby-sync.sh) | Local clone of `BACKUP_GIT_REMOTE` |
+| `BACKUP_GIT_BRANCH` | `main` | Branch backups are committed to / pulled from |
+| `BACKUP_FILE_NAME` | `memory-vault-export.age` | Encrypted export's file name inside the backup repo |
+| `MEMORY_VAULT_BIN` | `memory-vault` | Path to the `memory-vault` binary, for `backup.sh`/`standby-sync.sh`'s export/import calls |
+| `STANDBY_SYNC_LOG` | `/var/log/memory-vault-standby-sync.log` | `standby-sync.sh`'s outcome log (synced/skipped/failed, with counts) |
+| `STANDBY_STATE_DIR` | `/var/lib/memory-vault-backup/standby-state` | Where `standby-sync.sh` tracks the last-synced backup commit |
+| `HEALTH_URL` | *(required)* | The primary's `/healthz` URL, polled by `failover-watch.sh` |
+| `STANDBY_IP` | *(required)* | This host's IP, DNS is pointed here on failover |
+| `PRIMARY_IP` | *(required)* | The primary's IP, DNS is pointed back here on recovery |
+| `CF_ZONE_ID` | *(required)* | Cloudflare zone ID containing the DNS record to flip |
+| `CF_RECORD_ID` | *(required)* | Cloudflare DNS record ID to flip |
+| `CF_API_TOKEN` | *(required)* | Cloudflare API token, scoped to DNS edit only — not the DNS-01 cert token |
+| `FAILOVER_THRESHOLD` | `3` | Consecutive health check failures before failing over |
+| `RECOVERY_THRESHOLD` | `3` | Consecutive health check successes before failing back |
+| `CHECK_INTERVAL_SECONDS` | `30` | Seconds between health checks in `failover-watch.sh`'s loop mode |
+| `FAILOVER_COOLDOWN_MIN` | `10` | Minutes to wait after any DNS flip before flipping again |
+| `NOTIFY_WEBHOOK_URL` | *(none)* | If set, POSTs a small JSON payload here on every failover/recovery transition |
+| `CF_API_BASE_URL` | `https://api.cloudflare.com/client/v4` | Cloudflare API base URL (override for testing against a mock) |
+| `FAILOVER_STATE_DIR` | `/var/lib/memory-vault-failover` | Where `failover-watch.sh` persists its consecutive-check counters and cooldown timer |
+| `FAILOVER_LOG` | `/var/log/memory-vault-failover.log` | `failover-watch.sh`'s transition log |

@@ -1,0 +1,13 @@
+[Unit]
+Description=Run memory-vault-backup hourly
+
+[Timer]
+# Default: hourly. For a different interval, replace OnCalendar with e.g.
+# OnUnitActiveSec=30min (runs 30 minutes after each previous run finishes,
+# rather than on a fixed clock schedule).
+OnCalendar=hourly
+# Catch up on a missed run (e.g. host was off) at next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,33 @@
+[Unit]
+Description=memory-vault DNS failover watcher
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# Long-running, not a oneshot: failover-watch.sh loops internally
+# (CHECK_INTERVAL_SECONDS, default 30) — see its header comment for why
+# a systemd timer isn't a good fit at that granularity. Restart=always
+# means a crash just resumes polling; FAILOVER_STATE_DIR persists the
+# consecutive-failure/success counters and cooldown timer across restarts,
+# so a restart mid-cooldown doesn't reset it.
+#
+# Copy this file to /etc/systemd/system/ on the STANDBY host, then create
+# /etc/memory-vault-failover.env (chmod 600, root-owned) with:
+#   HEALTH_URL=https://memory-vault-primary.example.com/healthz
+#   STANDBY_IP=...
+#   PRIMARY_IP=...
+#   CF_ZONE_ID=...
+#   CF_RECORD_ID=...
+#   CF_API_TOKEN=...            (DNS-edit-only scoped token, not the DNS-01 cert token)
+#   NOTIFY_WEBHOOK_URL=...      (optional)
+# and any of failover-watch.sh's optional overrides.
+Type=simple
+EnvironmentFile=/etc/memory-vault-failover.env
+ExecStart=/opt/memory-vault/deploy/failover-watch.sh
+Restart=always
+RestartSec=10
+User=avishek
+WorkingDirectory=/opt/memory-vault
+
+[Install]
+WantedBy=multi-user.target

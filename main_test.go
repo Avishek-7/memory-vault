@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -133,6 +134,19 @@ func setupIntegrationDB(t *testing.T) {
 	st, err = store.Open(cfg)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
+	}
+}
+
+func TestIntegrationHealthz(t *testing.T) {
+	setupIntegrationDB(t)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	healthzHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"status":"ok"`) {
+		t.Errorf("body = %q, want it to contain status:ok", rec.Body.String())
 	}
 }
 
