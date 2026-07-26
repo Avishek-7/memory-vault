@@ -7,11 +7,21 @@ package embed
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 )
+
+// ErrContextLength is returned when the embedding backend rejects a chunk
+// as too long for its context window. Store's word-count-based chunking
+// (ChunkContent) is only an estimate — actual token density varies a lot
+// with content (markdown/code/paths tokenize far denser than prose) — so
+// callers use this to detect the failure and split the offending chunk
+// further, rather than trusting the word-count estimate to always hold.
+var ErrContextLength = errors.New("embedder: input exceeds context length")
 
 // Embedder turns text into a vector. Implementations must always return
 // vectors of the same length for a given configuration; Store validates
@@ -46,7 +56,11 @@ func (o *OllamaEmbedder) Embed(text string) ([]float32, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("ollama returned status %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		if strings.Contains(string(body), "context length") {
+			return nil, ErrContextLength
+		}
+		return nil, fmt.Errorf("ollama returned status %d: %s", resp.StatusCode, string(body))
 	}
 	var out struct {
 		Embedding []float32 `json:"embedding"`
