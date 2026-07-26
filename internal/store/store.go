@@ -25,11 +25,16 @@ import (
 const DefaultEmbedDim = 384
 
 // chunkTargetWords/chunkOverlapWords approximate all-minilm's 256-token
-// budget via word count (~0.75 words/token), leaving headroom. Other
-// embedding models may have a different real budget; this is a fixed
-// approximation regardless of the configured Embedder.
-const chunkTargetWords = 150
-const chunkOverlapWords = 15
+// budget via word count, leaving headroom. This is only an estimate: real
+// token density varies a lot by content (markdown/code/paths tokenize far
+// denser than plain prose — a 150-word chunk of session-log-style content
+// measured in practice at over 256 tokens, rejected by Ollama and surfaced
+// to callers as a bare internal error). saveMemory's embed loop treats this
+// as expected and adaptively splits any chunk the embedder actually rejects
+// (embed.ErrContextLength) rather than trusting this constant to always
+// hold — see embedChunkWithSplit.
+const chunkTargetWords = 100
+const chunkOverlapWords = 10
 
 const DefaultSpace = "default"
 
@@ -229,6 +234,35 @@ func (s *Store) Embed(text string) ([]float32, error) {
 	return vec, nil
 }
 
+// embedChunkWithSplit embeds chunk, appending it and its vector to *chunks/
+// *vectors on success. If the embedder rejects it as too long
+// (embed.ErrContextLength) — chunkTargetWords is only a word-count estimate
+// of token count, and dense content (markdown/code/paths) can still exceed
+// the real budget — it halves the chunk by words and retries each half,
+// recursing until every piece fits or hits a single word that still
+// doesn't (which is propagated as a real error; there's nothing more to
+// split).
+func (s *Store) embedChunkWithSplit(chunk string, chunks, vectors *[]string) error {
+	vec, err := s.Embed(chunk)
+	if err == nil {
+		*chunks = append(*chunks, chunk)
+		*vectors = append(*vectors, VectorLiteral(vec))
+		return nil
+	}
+	if !errors.Is(err, embed.ErrContextLength) {
+		return err
+	}
+	words := strings.Fields(chunk)
+	if len(words) <= 1 {
+		return err
+	}
+	mid := len(words) / 2
+	if err := s.embedChunkWithSplit(strings.Join(words[:mid], " "), chunks, vectors); err != nil {
+		return err
+	}
+	return s.embedChunkWithSplit(strings.Join(words[mid:], " "), chunks, vectors)
+}
+
 // VectorLiteral formats a float32 slice as pgvector's text input format, e.g. "[0.1,0.2,0.3]".
 func VectorLiteral(v []float32) string {
 	parts := make([]string, len(v))
@@ -377,19 +411,15 @@ func isUniqueViolation(err error) bool {
 // write happens; a mismatch returns a *SourceConflictError and writes
 // nothing.
 func (s *Store) saveMemory(space, name, content, source, kind string, overwrite bool, expectSource string) (wrote bool, chunks int, err error) {
-	chunkList := ChunkContent(content)
-
 	// Embed before opening the transaction: each Embed call is an HTTP
 	// round-trip to Ollama/OpenAI, and doing this inside the tx would hold
 	// the expectSource row lock (below) for the whole embedding pipeline
 	// instead of just the metadata check.
-	vectors := make([]string, len(chunkList))
-	for i, chunk := range chunkList {
-		vec, err := s.Embed(chunk)
-		if err != nil {
+	var chunkList, vectors []string
+	for _, chunk := range ChunkContent(content) {
+		if err := s.embedChunkWithSplit(chunk, &chunkList, &vectors); err != nil {
 			return false, 0, err
 		}
-		vectors[i] = VectorLiteral(vec)
 	}
 
 	tx, err := s.DB.Begin()
