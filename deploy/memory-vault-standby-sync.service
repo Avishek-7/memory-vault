@@ -1,0 +1,18 @@
+[Unit]
+Description=memory-vault standby sync
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Copy this file to /etc/systemd/system/ on the STANDBY host, then create
+# /etc/memory-vault-standby-sync.env (chmod 600, root-owned) with:
+#   DATABASE_URL=postgres://...      (the standby's own local Postgres)
+#   OLLAMA_URL=http://...            (the standby's own local Ollama, for import's re-embed)
+#   BACKUP_GIT_REMOTE=git@example.com:you/memory-vault-backups.git
+#   AGE_IDENTITY=/etc/memory-vault/age-key.txt   (chmod 600 — this decrypts every backup)
+# and any of standby-sync.sh's optional overrides.
+EnvironmentFile=/etc/memory-vault-standby-sync.env
+ExecStart=/opt/memory-vault/deploy/standby-sync.sh
+User=avishek
+WorkingDirectory=/opt/memory-vault
