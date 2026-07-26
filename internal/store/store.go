@@ -57,6 +57,20 @@ func IsValidKind(k string) bool {
 	return false
 }
 
+// ValidFlags are the only values flag_memory accepts. A memory has at most
+// one current flag (set by FlagMemory), not a flag history.
+var ValidFlags = []string{"useful", "stale", "wrong"}
+
+// IsValidFlag reports whether f is one of ValidFlags.
+func IsValidFlag(f string) bool {
+	for _, v := range ValidFlags {
+		if f == v {
+			return true
+		}
+	}
+	return false
+}
+
 // migrationSQL is templated on the embedding dimension so a non-default
 // EMBED_DIM is reflected in the vector column at table-creation time.
 func migrationSQL(dim int) string {
@@ -75,6 +89,9 @@ func migrationSQL(dim int) string {
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS space TEXT NOT NULL DEFAULT 'default';
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'unspecified';
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'note';
+		ALTER TABLE memories ADD COLUMN IF NOT EXISTS flag TEXT;
+		ALTER TABLE memories ADD COLUMN IF NOT EXISTS flagged_at TIMESTAMPTZ;
+		ALTER TABLE memories ADD COLUMN IF NOT EXISTS flag_note TEXT;
 		DO $$
 		BEGIN
 			IF (SELECT array_length(conkey, 1) FROM pg_constraint
@@ -405,6 +422,21 @@ func (s *Store) saveMemory(space, name, content, source, kind string, overwrite 
 	return true, len(chunkList), nil
 }
 
+// FlagMemory sets (or overwrites) the single current flag on every chunk of
+// (space, name). Callers must validate flag against ValidFlags themselves
+// (IsValidFlag). The bool reports whether the memory was found.
+func (s *Store) FlagMemory(space, name, flag, note string) (bool, error) {
+	res, err := s.DB.Exec(`
+		UPDATE memories SET flag = $1, flagged_at = now(), flag_note = $2
+		WHERE space = $3 AND name = $4
+	`, flag, note, space, name)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	return affected > 0, err
+}
+
 // DeleteMemory deletes a memory by (space, name); the bool reports whether
 // anything was deleted.
 func (s *Store) DeleteMemory(space, name string) (bool, error) {
@@ -605,31 +637,35 @@ type MemoryCentroid struct {
 	Name        string
 	Source      string
 	Kind        string
+	Flag        string // "", "useful", "stale", or "wrong"
 	Centroid    []float64
 	LastUpdated time.Time
 }
 
 // MemoryCentroids returns every memory name in a space with its centroid
-// embedding (the average of its chunk embeddings), source, kind, and most
-// recent update time.
+// embedding (the average of its chunk embeddings), source, kind, flag, and
+// most recent update time.
 func (s *Store) MemoryCentroids(space string) ([]MemoryCentroid, error) {
-	rows, err := s.DB.Query(`SELECT name, max(source), max(kind), avg(embedding)::text, max(updated_at) FROM memories WHERE space = $1 GROUP BY name`, space)
+	rows, err := s.DB.Query(`
+		SELECT name, max(source), max(kind), max(coalesce(flag, '')), avg(embedding)::text, max(updated_at)
+		FROM memories WHERE space = $1 GROUP BY name
+	`, space)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []MemoryCentroid
 	for rows.Next() {
-		var name, source, kind, centroidStr string
+		var name, source, kind, flag, centroidStr string
 		var lastUpdated time.Time
-		if err := rows.Scan(&name, &source, &kind, &centroidStr, &lastUpdated); err != nil {
+		if err := rows.Scan(&name, &source, &kind, &flag, &centroidStr, &lastUpdated); err != nil {
 			return nil, err
 		}
 		centroid, err := ParseVectorLiteral(centroidStr)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, MemoryCentroid{Name: name, Source: source, Kind: kind, Centroid: centroid, LastUpdated: lastUpdated})
+		out = append(out, MemoryCentroid{Name: name, Source: source, Kind: kind, Flag: flag, Centroid: centroid, LastUpdated: lastUpdated})
 	}
 	return out, rows.Err()
 }

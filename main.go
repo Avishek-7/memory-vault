@@ -127,9 +127,18 @@ func searchWeights() store.SearchWeights {
 // validKindsList renders store.ValidKinds for error messages, e.g.
 // `"fact", "decision", "preference", "task", "note"`.
 func validKindsList() string {
-	quoted := make([]string, len(store.ValidKinds))
-	for i, k := range store.ValidKinds {
-		quoted[i] = fmt.Sprintf("%q", k)
+	return quotedList(store.ValidKinds)
+}
+
+// validFlagsList renders store.ValidFlags for error messages.
+func validFlagsList() string {
+	return quotedList(store.ValidFlags)
+}
+
+func quotedList(vals []string) string {
+	quoted := make([]string, len(vals))
+	for i, v := range vals {
+		quoted[i] = fmt.Sprintf("%q", v)
 	}
 	return strings.Join(quoted, ", ")
 }
@@ -230,6 +239,11 @@ var tools = []tool{
 		Name:        "delete_memory",
 		Description: "Delete a memory by name, optionally scoped to a space (default: \"default\").",
 		InputSchema: schema([]string{"name"}, map[string]string{"name": "string", "space": "string"}),
+	},
+	{
+		Name:        "flag_memory",
+		Description: "Set a usage/quality flag on a memory: useful, stale, or wrong. A new flag overwrites any previous one — a memory has one current flag, not a history. Influences compact_memories candidate selection: stale/wrong make a memory a stronger candidate regardless of age; useful protects it from age-based (but not similarity-based) selection. Optional note explains why.",
+		InputSchema: schema([]string{"name", "flag"}, map[string]string{"name": "string", "space": "string", "flag": "string", "note": "string"}),
 	},
 	{
 		Name:        "compact_memories",
@@ -340,8 +354,17 @@ func compactGroupsForSpace(space string) ([][]store.MemoryCentroid, error) {
 	}
 	var groups [][]store.MemoryCentroid
 	for _, idxs := range byRoot {
-		if len(idxs) == 1 && infos[idxs[0]].LastUpdated.After(staleCutoff) {
-			continue // neither similar to a sibling nor stale: leave alone
+		if len(idxs) == 1 {
+			m := infos[idxs[0]]
+			flaggedBad := m.Flag == "stale" || m.Flag == "wrong"
+			stale := !m.LastUpdated.After(staleCutoff)
+			// "useful" protects against age-based pruning alone (it's not
+			// grouped here anyway, since len==1 means no similar sibling
+			// pulled it in); "stale"/"wrong" make a memory a candidate
+			// regardless of age.
+			if m.Flag == "useful" || (!stale && !flaggedBad) {
+				continue // neither similar to a sibling, stale, nor flagged stale/wrong
+			}
 		}
 		g := make([]store.MemoryCentroid, len(idxs))
 		for k, idx := range idxs {
@@ -365,7 +388,14 @@ func compactGroup(space string, g []store.MemoryCentroid, dryRun bool) (string, 
 	if dryRun {
 		reason := "similar"
 		if len(g) == 1 {
-			reason = "stale"
+			switch g[0].Flag {
+			case "wrong":
+				reason = "flagged wrong"
+			case "stale":
+				reason = "flagged stale"
+			default:
+				reason = "stale"
+			}
 		}
 		return fmt.Sprintf("space %q: [%s] -> would merge into %q (%s)", space, strings.Join(names, ", "), newName, reason), nil
 	}
@@ -530,6 +560,26 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			return errResult(fmt.Sprintf("memory %q not found in space %q", n, space))
 		}
 		return textResult(fmt.Sprintf("deleted memory %q from space %q", n, space))
+
+	case "flag_memory":
+		n, _ := args["name"].(string)
+		space := argSpace(args)
+		flag, _ := args["flag"].(string)
+		note, _ := args["note"].(string)
+		if n == "" || flag == "" {
+			return errResult("name and flag are required")
+		}
+		if !store.IsValidFlag(flag) {
+			return errResult(fmt.Sprintf("invalid flag %q, want one of: %s", flag, validFlagsList()))
+		}
+		found, err := st.FlagMemory(space, n, flag, note)
+		if err != nil {
+			return internalErr("flag_memory", err)
+		}
+		if !found {
+			return errResult(fmt.Sprintf("memory %q not found in space %q", n, space))
+		}
+		return textResult(fmt.Sprintf("flagged memory %q in space %q as %q", n, space, flag))
 
 	case "compact_memories":
 		dryRun := true

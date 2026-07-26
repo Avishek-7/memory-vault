@@ -82,6 +82,7 @@ client at `http://localhost:8080/mcp` (see
 | `list_memories` | List stored memory names. Optional `source`/`kind` filters. |
 | `search_memories` | Hybrid (semantic + keyword + recency + optional per-kind boost) search, top `limit` matches (default 5, max 20). Optional `source`/`kind` filters. |
 | `delete_memory` | Delete a memory by name. |
+| `flag_memory` | Set a usage/quality flag (`useful`, `stale`, or `wrong`) on a memory, with an optional `note`. Overwrites any previous flag — one current flag per memory, not a history. Influences `compact_memories` candidate selection. |
 | `compact_memories` | Merge/summarize near-duplicate or stale memories via the local Ollama chat model. Never selects `decision`-kind memories. |
 | `export_memories` | Export memories as JSON (no embeddings). Optional `space`/`source`; omit both to export everything. |
 | `import_memories` | Import memories from JSON in the shape `export_memories` produces. Re-chunks/re-embeds through the normal save path. Optional `space`/`source` overrides. |
@@ -152,6 +153,15 @@ memory nor picked up by staleness pruning, no matter how old or similar to
 something else it is. If you want a decision reconsidered or superseded,
 do that explicitly (`save_memory` a new one, `delete_memory` the old one)
 rather than relying on compaction to do it for you.
+
+**`flag_memory` shifts candidate selection beyond age/similarity alone.**
+A memory flagged `stale` or `wrong` becomes a compaction candidate
+regardless of how recently it was updated (`compact_memories`'s dry-run
+plan says why: "flagged stale"/"flagged wrong" instead of just "stale"). A
+memory flagged `useful` is protected from age-based selection — being old
+alone won't pull it in — but it can still be grouped into a merge if it's a
+genuine near-duplicate by embedding similarity; `useful` guards against
+"nobody's touched this in 90 days" pruning, not against real dedup.
 
 ## Export / import
 
