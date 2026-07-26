@@ -862,6 +862,31 @@ func checkHost(r *http.Request) bool {
 	return false
 }
 
+// healthzHandler answers "can this instance serve MCP requests" — a cheap
+// Postgres ping, nothing more. It deliberately doesn't check Ollama:
+// embedding/chat calls failing because Ollama is down is a lesser,
+// separate concern from the whole instance being unreachable, and this
+// endpoint exists for failover-watch.sh (deploy/failover-watch.sh) to
+// decide whether to flip DNS to a standby. No AUTH_TOKEN check — health
+// checkers won't carry a bearer token — but still subject to checkHost:
+// a legitimate health checker hits the same allowlisted hostname clients
+// do, so this doesn't weaken the DNS-rebinding guard, just doesn't gate
+// health on possession of a secret.
+func healthzHandler(w http.ResponseWriter, r *http.Request) {
+	if !checkHost(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := st.DB.Exec("SELECT 1"); err != nil {
+		log.Printf("healthz: db ping failed: %v", err)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "error", "db": "unreachable"})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "db": "ok"})
+}
+
 func mcpHandler(w http.ResponseWriter, r *http.Request) {
 	if !checkHost(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
@@ -976,6 +1001,7 @@ func main() {
 
 	addr := ":" + envOr("PORT", "8080")
 	http.HandleFunc("/mcp", mcpHandler)
+	http.HandleFunc("/healthz", healthzHandler)
 	log.Printf("memory-vault listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
