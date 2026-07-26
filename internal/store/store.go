@@ -38,6 +38,25 @@ const DefaultSpace = "default"
 // like space.
 const DefaultSource = "unspecified"
 
+// DefaultKind is recorded on a memory when no kind is given.
+const DefaultKind = "note"
+
+// ValidKinds are the only structured memory types save_memory accepts.
+// Enforced at the application level (not a DB constraint) so validation
+// errors are a clear message instead of an opaque SQL error, and so the
+// set can grow without a migration.
+var ValidKinds = []string{"fact", "decision", "preference", "task", "note"}
+
+// IsValidKind reports whether k is one of ValidKinds.
+func IsValidKind(k string) bool {
+	for _, v := range ValidKinds {
+		if k == v {
+			return true
+		}
+	}
+	return false
+}
+
 // migrationSQL is templated on the embedding dimension so a non-default
 // EMBED_DIM is reflected in the vector column at table-creation time.
 func migrationSQL(dim int) string {
@@ -55,6 +74,7 @@ func migrationSQL(dim int) string {
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS chunk_index INT NOT NULL DEFAULT 0;
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS space TEXT NOT NULL DEFAULT 'default';
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'unspecified';
+		ALTER TABLE memories ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'note';
 		DO $$
 		BEGIN
 			IF (SELECT array_length(conkey, 1) FROM pg_constraint
@@ -239,29 +259,30 @@ func CosineDistance(a, b []float64) float64 {
 type MemoryMeta struct {
 	Content string
 	Source  string
+	Kind    string
 }
 
 // ReassembleMeta fetches all chunks for (space, name) ordered by chunk_index,
 // joins their content back into the original text, and returns the memory's
-// source alongside it. Returns a zero MemoryMeta with no error if the memory
-// doesn't exist.
+// source/kind alongside it. Returns a zero MemoryMeta with no error if the
+// memory doesn't exist.
 func (s *Store) ReassembleMeta(space, name string) (MemoryMeta, error) {
-	rows, err := s.DB.Query(`SELECT content, source FROM memories WHERE space = $1 AND name = $2 ORDER BY chunk_index`, space, name)
+	rows, err := s.DB.Query(`SELECT content, source, kind FROM memories WHERE space = $1 AND name = $2 ORDER BY chunk_index`, space, name)
 	if err != nil {
 		return MemoryMeta{}, err
 	}
 	defer rows.Close()
 	var parts []string
-	var source string
+	var source, kind string
 	for rows.Next() {
-		var c, src string
-		if err := rows.Scan(&c, &src); err != nil {
+		var c, src, k string
+		if err := rows.Scan(&c, &src, &k); err != nil {
 			return MemoryMeta{}, err
 		}
 		parts = append(parts, c)
-		source = src
+		source, kind = src, k
 	}
-	return MemoryMeta{Content: strings.Join(parts, " "), Source: source}, rows.Err()
+	return MemoryMeta{Content: strings.Join(parts, " "), Source: source, Kind: kind}, rows.Err()
 }
 
 // Reassemble fetches all chunks for (space, name) ordered by chunk_index
@@ -284,12 +305,17 @@ func (e *SourceConflictError) Error() string {
 
 // SaveMemory chunks, embeds, and (re)writes content under (space, name),
 // replacing any existing chunks for that name. Returns the chunk count.
-// An empty source is recorded as DefaultSource.
-func (s *Store) SaveMemory(space, name, content, source string) (int, error) {
+// An empty source is recorded as DefaultSource; an empty kind is recorded
+// as DefaultKind. Callers must validate kind against ValidKinds themselves
+// (IsValidKind) — Store trusts it here.
+func (s *Store) SaveMemory(space, name, content, source, kind string) (int, error) {
 	if source == "" {
 		source = DefaultSource
 	}
-	_, chunks, err := s.saveMemory(space, name, content, source, true, "")
+	if kind == "" {
+		kind = DefaultKind
+	}
+	_, chunks, err := s.saveMemory(space, name, content, source, kind, true, "")
 	return chunks, err
 }
 
@@ -300,11 +326,14 @@ func (s *Store) SaveMemory(space, name, content, source string) (int, error) {
 // differently-sourced agents avoid silently clobbering each other's
 // same-named memory. An empty expectSource skips the check entirely
 // (SaveMemory's behavior).
-func (s *Store) SaveMemoryExpectSource(space, name, content, source, expectSource string) (int, error) {
+func (s *Store) SaveMemoryExpectSource(space, name, content, source, kind, expectSource string) (int, error) {
 	if source == "" {
 		source = DefaultSource
 	}
-	_, chunks, err := s.saveMemory(space, name, content, source, true, expectSource)
+	if kind == "" {
+		kind = DefaultKind
+	}
+	_, chunks, err := s.saveMemory(space, name, content, source, kind, true, expectSource)
 	return chunks, err
 }
 
@@ -330,7 +359,7 @@ func isUniqueViolation(err error) bool {
 // row-locked and its source compared against expectSource before any
 // write happens; a mismatch returns a *SourceConflictError and writes
 // nothing.
-func (s *Store) saveMemory(space, name, content, source string, overwrite bool, expectSource string) (wrote bool, chunks int, err error) {
+func (s *Store) saveMemory(space, name, content, source, kind string, overwrite bool, expectSource string) (wrote bool, chunks int, err error) {
 	chunkList := ChunkContent(content)
 	tx, err := s.DB.Begin()
 	if err != nil {
@@ -360,9 +389,9 @@ func (s *Store) saveMemory(space, name, content, source string, overwrite bool, 
 			return false, 0, err
 		}
 		_, err = tx.Exec(`
-			INSERT INTO memories (space, name, chunk_index, content, embedding, source, updated_at)
-			VALUES ($1, $2, $3, $4, $5::vector, $6, now())
-		`, space, name, i, chunk, VectorLiteral(vec), source)
+			INSERT INTO memories (space, name, chunk_index, content, embedding, source, kind, updated_at)
+			VALUES ($1, $2, $3, $4, $5::vector, $6, $7, now())
+		`, space, name, i, chunk, VectorLiteral(vec), source, kind)
 		if err != nil {
 			if !overwrite && isUniqueViolation(err) {
 				return false, 0, nil
@@ -388,13 +417,17 @@ func (s *Store) DeleteMemory(space, name string) (bool, error) {
 }
 
 // ListMemoryNames lists the distinct memory names within a space, optionally
-// filtered to those with the given source (source == "" means no filter).
-func (s *Store) ListMemoryNames(space, source string) ([]string, error) {
+// filtered by source and/or kind (either "" means no filter on that field).
+func (s *Store) ListMemoryNames(space, source, kind string) ([]string, error) {
 	query := `SELECT DISTINCT name FROM memories WHERE space = $1`
 	args := []interface{}{space}
 	if source != "" {
-		query += ` AND source = $2`
 		args = append(args, source)
+		query += fmt.Sprintf(" AND source = $%d", len(args))
+	}
+	if kind != "" {
+		args = append(args, kind)
+		query += fmt.Sprintf(" AND kind = $%d", len(args))
 	}
 	query += ` ORDER BY name`
 	rows, err := s.DB.Query(query, args...)
@@ -417,17 +450,26 @@ type SpaceName struct {
 	Space  string
 	Name   string
 	Source string
+	Kind   string
 }
 
 // ListAll lists every (space, name) pair across all spaces, ordered by
-// space then name, optionally filtered to a source (source == "" means no
-// filter).
-func (s *Store) ListAll(source string) ([]SpaceName, error) {
-	query := `SELECT DISTINCT space, name, source FROM memories`
+// space then name, optionally filtered by source and/or kind (either ""
+// means no filter on that field).
+func (s *Store) ListAll(source, kind string) ([]SpaceName, error) {
+	query := `SELECT DISTINCT space, name, source, kind FROM memories`
+	var clauses []string
 	var args []interface{}
 	if source != "" {
-		query += ` WHERE source = $1`
 		args = append(args, source)
+		clauses = append(clauses, fmt.Sprintf("source = $%d", len(args)))
+	}
+	if kind != "" {
+		args = append(args, kind)
+		clauses = append(clauses, fmt.Sprintf("kind = $%d", len(args)))
+	}
+	if len(clauses) > 0 {
+		query += ` WHERE ` + strings.Join(clauses, " AND ")
 	}
 	query += ` ORDER BY space, name`
 	rows, err := s.DB.Query(query, args...)
@@ -438,7 +480,7 @@ func (s *Store) ListAll(source string) ([]SpaceName, error) {
 	var out []SpaceName
 	for rows.Next() {
 		var sn SpaceName
-		if err := rows.Scan(&sn.Space, &sn.Name, &sn.Source); err != nil {
+		if err := rows.Scan(&sn.Space, &sn.Name, &sn.Source, &sn.Kind); err != nil {
 			return nil, err
 		}
 		out = append(out, sn)
@@ -464,13 +506,16 @@ func (s *Store) Spaces() ([]string, error) {
 	return out, rows.Err()
 }
 
-// SearchWeights controls how SearchMemories blends its three signals;
-// defaults elsewhere reproduce semantic-only ranking.
+// SearchWeights controls how SearchMemories blends its signals; defaults
+// elsewhere reproduce semantic-only ranking. KindBoost, if set, adds a flat
+// per-kind amount to a match's score (keyed by kind, e.g. "decision");
+// a nil/empty map or missing key adds nothing.
 type SearchWeights struct {
 	Semantic     float64
 	Keyword      float64
 	Recency      float64
 	HalfLifeDays float64
+	KindBoost    map[string]float64
 }
 
 type SearchMatch struct {
@@ -479,25 +524,29 @@ type SearchMatch struct {
 	Content string
 }
 
-// SearchMemories runs hybrid (semantic + keyword + recency) search within a
-// space and returns up to limit matches, highest score first, with each
-// match's content already reassembled. An optional source filters candidates
-// to that source only ("" means no filter).
-func (s *Store) SearchMemories(space, query string, limit int, w SearchWeights, source string) ([]SearchMatch, error) {
+// SearchMemories runs hybrid (semantic + keyword + recency + per-kind boost)
+// search within a space and returns up to limit matches, highest score
+// first, with each match's content already reassembled. Optional source/kind
+// filter candidates ("" means no filter on that field).
+func (s *Store) SearchMemories(space, query string, limit int, w SearchWeights, source, kind string) ([]SearchMatch, error) {
 	vec, err := s.Embed(query)
 	if err != nil {
 		return nil, err
 	}
 	sqlQuery := `
-		SELECT name, embedding <=> $1::vector AS distance,
+		SELECT name, kind, embedding <=> $1::vector AS distance,
 		       ts_rank(content_tsv, plainto_tsquery('english', $2)) AS rank,
 		       updated_at
 		FROM memories
 		WHERE space = $3`
 	args := []interface{}{VectorLiteral(vec), query, space}
 	if source != "" {
-		sqlQuery += ` AND source = $4`
 		args = append(args, source)
+		sqlQuery += fmt.Sprintf(" AND source = $%d", len(args))
+	}
+	if kind != "" {
+		args = append(args, kind)
+		sqlQuery += fmt.Sprintf(" AND kind = $%d", len(args))
 	}
 	sqlQuery += fmt.Sprintf(` ORDER BY distance ASC LIMIT $%d`, len(args)+1)
 	args = append(args, limit*5)
@@ -511,16 +560,16 @@ func (s *Store) SearchMemories(space, query string, limit int, w SearchWeights, 
 	}
 	best := map[string]nameScore{}
 	for rows.Next() {
-		var n string
+		var n, k string
 		var dist, rank float64
 		var updatedAt time.Time
-		if err := rows.Scan(&n, &dist, &rank, &updatedAt); err != nil {
+		if err := rows.Scan(&n, &k, &dist, &rank, &updatedAt); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		days := time.Since(updatedAt).Hours() / 24
 		recency := math.Exp(-math.Ln2 * days / w.HalfLifeDays)
-		score := w.Semantic*(1-dist) + w.Keyword*rank + w.Recency*recency
+		score := w.Semantic*(1-dist) + w.Keyword*rank + w.Recency*recency + w.KindBoost[k]
 		if cur, ok := best[n]; !ok || score > cur.score {
 			best[n] = nameScore{name: n, score: score}
 		}
@@ -555,31 +604,32 @@ func (s *Store) SearchMemories(space, query string, limit int, w SearchWeights, 
 type MemoryCentroid struct {
 	Name        string
 	Source      string
+	Kind        string
 	Centroid    []float64
 	LastUpdated time.Time
 }
 
 // MemoryCentroids returns every memory name in a space with its centroid
-// embedding (the average of its chunk embeddings), source, and most recent
-// update time.
+// embedding (the average of its chunk embeddings), source, kind, and most
+// recent update time.
 func (s *Store) MemoryCentroids(space string) ([]MemoryCentroid, error) {
-	rows, err := s.DB.Query(`SELECT name, max(source), avg(embedding)::text, max(updated_at) FROM memories WHERE space = $1 GROUP BY name`, space)
+	rows, err := s.DB.Query(`SELECT name, max(source), max(kind), avg(embedding)::text, max(updated_at) FROM memories WHERE space = $1 GROUP BY name`, space)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []MemoryCentroid
 	for rows.Next() {
-		var name, source, centroidStr string
+		var name, source, kind, centroidStr string
 		var lastUpdated time.Time
-		if err := rows.Scan(&name, &source, &centroidStr, &lastUpdated); err != nil {
+		if err := rows.Scan(&name, &source, &kind, &centroidStr, &lastUpdated); err != nil {
 			return nil, err
 		}
 		centroid, err := ParseVectorLiteral(centroidStr)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, MemoryCentroid{Name: name, Source: source, Centroid: centroid, LastUpdated: lastUpdated})
+		out = append(out, MemoryCentroid{Name: name, Source: source, Kind: kind, Centroid: centroid, LastUpdated: lastUpdated})
 	}
 	return out, rows.Err()
 }
@@ -591,6 +641,7 @@ type MemoryExport struct {
 	Name      string    `json:"name"`
 	Space     string    `json:"space"`
 	Source    string    `json:"source,omitempty"`
+	Kind      string    `json:"kind,omitempty"`
 	Content   string    `json:"content"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -599,7 +650,7 @@ type MemoryExport struct {
 // ordered by space then name. Exports every space if space == "", and
 // every source if source == "".
 func (s *Store) Export(space, source string) ([]MemoryExport, error) {
-	query := `SELECT space, name, source, content, updated_at FROM memories`
+	query := `SELECT space, name, source, kind, content, updated_at FROM memories`
 	var clauses []string
 	var args []interface{}
 	if space != "" {
@@ -622,15 +673,15 @@ func (s *Store) Export(space, source string) ([]MemoryExport, error) {
 
 	var out []MemoryExport
 	for rows.Next() {
-		var sp, name, src, content string
+		var sp, name, src, kind, content string
 		var updatedAt time.Time
-		if err := rows.Scan(&sp, &name, &src, &content, &updatedAt); err != nil {
+		if err := rows.Scan(&sp, &name, &src, &kind, &content, &updatedAt); err != nil {
 			return nil, err
 		}
 		if n := len(out); n > 0 && out[n-1].Space == sp && out[n-1].Name == name {
 			out[n-1].Content += " " + content // rejoin chunks, same as Reassemble
 		} else {
-			out = append(out, MemoryExport{Space: sp, Name: name, Source: src, Content: content, UpdatedAt: updatedAt})
+			out = append(out, MemoryExport{Space: sp, Name: name, Source: src, Kind: kind, Content: content, UpdatedAt: updatedAt})
 		}
 	}
 	return out, rows.Err()
@@ -670,7 +721,11 @@ func (s *Store) Import(data []MemoryExport, spaceOverride, sourceOverride string
 		if source == "" {
 			source = DefaultSource
 		}
-		wrote, _, err := s.saveMemory(space, m.Name, m.Content, source, overwrite, "")
+		kind := m.Kind
+		if kind == "" || !IsValidKind(kind) {
+			kind = DefaultKind // backward-compat with pre-Phase-2 exports, and a safety net against a hand-edited payload
+		}
+		wrote, _, err := s.saveMemory(space, m.Name, m.Content, source, kind, overwrite, "")
 		if err != nil {
 			return res, err
 		}

@@ -108,14 +108,30 @@ func storeConfig() (store.Config, error) {
 }
 
 // search scoring weights: default to semantic-only ranking (identical to
-// pre-hybrid-search behavior) unless overridden.
+// pre-hybrid-search behavior) unless overridden. Per-kind boosts all default
+// to 0 (no ranking change) unless a SEARCH_KIND_BOOST_<KIND> env var opts in.
 func searchWeights() store.SearchWeights {
+	boosts := map[string]float64{}
+	for _, k := range store.ValidKinds {
+		boosts[k] = envOrFloat("SEARCH_KIND_BOOST_"+strings.ToUpper(k), 0.0)
+	}
 	return store.SearchWeights{
 		Semantic:     envOrFloat("SEARCH_WEIGHT_SEMANTIC", 1.0),
 		Keyword:      envOrFloat("SEARCH_WEIGHT_KEYWORD", 0.0),
 		Recency:      envOrFloat("SEARCH_WEIGHT_RECENCY", 0.0),
 		HalfLifeDays: envOrFloat("SEARCH_RECENCY_HALFLIFE_DAYS", 30.0),
+		KindBoost:    boosts,
 	}
+}
+
+// validKindsList renders store.ValidKinds for error messages, e.g.
+// `"fact", "decision", "preference", "task", "note"`.
+func validKindsList() string {
+	quoted := make([]string, len(store.ValidKinds))
+	for i, k := range store.ValidKinds {
+		quoted[i] = fmt.Sprintf("%q", k)
+	}
+	return strings.Join(quoted, ", ")
 }
 
 func argSpace(args map[string]interface{}) string {
@@ -192,8 +208,8 @@ type tool struct {
 var tools = []tool{
 	{
 		Name:        "save_memory",
-		Description: "Create or overwrite a memory by name with the given content, optionally in a named space (default: \"default\"). Content is chunked and embedded via Ollama for later semantic search. Optional source records which agent wrote it (default: \"unspecified\"); optional expect_source rejects the write instead of overwriting if a memory already exists there under a different source.",
-		InputSchema: schema([]string{"name", "content"}, map[string]string{"name": "string", "content": "string", "space": "string", "source": "string", "expect_source": "string"}),
+		Description: "Create or overwrite a memory by name with the given content, optionally in a named space (default: \"default\"). Content is chunked and embedded via Ollama for later semantic search. Optional source records which agent wrote it (default: \"unspecified\"); optional expect_source rejects the write instead of overwriting if a memory already exists there under a different source. Optional kind (default: \"note\") is one of fact, decision, preference, task, note.",
+		InputSchema: schema([]string{"name", "content"}, map[string]string{"name": "string", "content": "string", "space": "string", "source": "string", "expect_source": "string", "kind": "string"}),
 	},
 	{
 		Name:        "get_memory",
@@ -202,13 +218,13 @@ var tools = []tool{
 	},
 	{
 		Name:        "list_memories",
-		Description: "List the names of stored memories. Pass space to filter to one space; omit it to list all memories grouped by space. Optional source filters to memories written by that source.",
-		InputSchema: schema(nil, map[string]string{"space": "string", "source": "string"}),
+		Description: "List the names of stored memories. Pass space to filter to one space; omit it to list all memories grouped by space. Optional source/kind filters narrow the results.",
+		InputSchema: schema(nil, map[string]string{"space": "string", "source": "string", "kind": "string"}),
 	},
 	{
 		Name:        "search_memories",
-		Description: "Hybrid search (semantic + keyword + recency) over stored memories in a space (default: \"default\"). Returns up to `limit` (default 5, max 20) closest matches with their full content. Optional source filters candidates to that source.",
-		InputSchema: schema([]string{"query"}, map[string]string{"query": "string", "space": "string", "limit": "number", "source": "string"}),
+		Description: "Hybrid search (semantic + keyword + recency + optional per-kind boost) over stored memories in a space (default: \"default\"). Returns up to `limit` (default 5, max 20) closest matches with their full content. Optional source/kind filters narrow the candidates.",
+		InputSchema: schema([]string{"query"}, map[string]string{"query": "string", "space": "string", "limit": "number", "source": "string", "kind": "string"}),
 	},
 	{
 		Name:        "delete_memory",
@@ -217,12 +233,12 @@ var tools = []tool{
 	},
 	{
 		Name:        "compact_memories",
-		Description: "Find near-duplicate or stale memories (within a space, or all spaces if omitted) and merge/summarize them via the local Ollama chat model. dry_run (default true) returns the proposed plan without writing anything.",
+		Description: "Find near-duplicate or stale memories (within a space, or all spaces if omitted) and merge/summarize them via the local Ollama chat model. Memories of kind \"decision\" are never selected for compaction. dry_run (default true) returns the proposed plan without writing anything.",
 		InputSchema: schema(nil, map[string]string{"space": "string", "dry_run": "boolean"}),
 	},
 	{
 		Name:        "export_memories",
-		Description: "Export memories as JSON (name, space, source, content, updated_at — no embeddings, which are cheap to regenerate on import). Optional space exports just that space; optional source exports just that source; omit both to export everything.",
+		Description: "Export memories as JSON (name, space, source, kind, content, updated_at — no embeddings, which are cheap to regenerate on import). Optional space exports just that space; optional source exports just that source; omit both to export everything.",
 		InputSchema: schema(nil, map[string]string{"space": "string", "source": "string"}),
 	},
 	{
@@ -274,9 +290,19 @@ func compactTargetName(names []string) string {
 // chain of near-duplicate centroids), plus lone memories past the
 // staleness window (candidates for solo re-summarization).
 func compactGroupsForSpace(space string) ([][]store.MemoryCentroid, error) {
-	infos, err := st.MemoryCentroids(space)
+	all, err := st.MemoryCentroids(space)
 	if err != nil {
 		return nil, err
+	}
+	// Decisions are never compaction candidates — they record something
+	// that was explicitly decided, and merging or age-based pruning could
+	// silently lose that. Excluded here, before grouping, so they can't be
+	// pulled into a sibling's merge either.
+	var infos []store.MemoryCentroid
+	for _, m := range all {
+		if m.Kind != "decision" {
+			infos = append(infos, m)
+		}
 	}
 
 	threshold, staleDays := compactionSettings()
@@ -361,13 +387,16 @@ func compactGroup(space string, g []store.MemoryCentroid, dryRun bool) (string, 
 	if merged == "" {
 		return "", fmt.Errorf("ollama returned an empty summary")
 	}
-	// A solo re-summarization keeps its source; a multi-source merge has no
-	// single rightful owner, so it's recorded as DefaultSource.
-	mergedSource := store.DefaultSource
+	// A solo re-summarization keeps its source/kind; a multi-source merge
+	// has no single rightful owner, so it's recorded as DefaultSource and,
+	// since it's now a synthesized note rather than any one original
+	// memory's structured type, DefaultKind (decisions are already
+	// excluded from grouping above, so this never demotes one).
+	mergedSource, mergedKind := store.DefaultSource, store.DefaultKind
 	if len(g) == 1 {
-		mergedSource = g[0].Source
+		mergedSource, mergedKind = g[0].Source, g[0].Kind
 	}
-	if _, err := st.SaveMemory(space, newName, merged, mergedSource); err != nil {
+	if _, err := st.SaveMemory(space, newName, merged, mergedSource, mergedKind); err != nil {
 		return "", err
 	}
 	for _, m := range g {
@@ -392,24 +421,31 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		if source == "" {
 			source = store.DefaultSource
 		}
+		kind, _ := args["kind"].(string)
+		if kind == "" {
+			kind = store.DefaultKind
+		}
 		if n == "" || content == "" {
 			return errResult("name and content are required")
+		}
+		if !store.IsValidKind(kind) {
+			return errResult(fmt.Sprintf("invalid kind %q, want one of: %s", kind, validKindsList()))
 		}
 		var numChunks int
 		var err error
 		if expectSource, _ := args["expect_source"].(string); expectSource != "" {
-			numChunks, err = st.SaveMemoryExpectSource(space, n, content, source, expectSource)
+			numChunks, err = st.SaveMemoryExpectSource(space, n, content, source, kind, expectSource)
 			var conflict *store.SourceConflictError
 			if errors.As(err, &conflict) {
 				return errResult(fmt.Sprintf("memory %q in space %q already exists with source %q, not %q — refusing to overwrite", n, space, conflict.Existing, expectSource))
 			}
 		} else {
-			numChunks, err = st.SaveMemory(space, n, content, source)
+			numChunks, err = st.SaveMemory(space, n, content, source, kind)
 		}
 		if err != nil {
 			return internalErr("save_memory", err)
 		}
-		return textResult(fmt.Sprintf("saved memory %q in space %q (source %q, %d bytes, %d chunk(s))", n, space, source, len(content), numChunks))
+		return textResult(fmt.Sprintf("saved memory %q in space %q (source %q, kind %q, %d bytes, %d chunk(s))", n, space, source, kind, len(content), numChunks))
 
 	case "get_memory":
 		n, _ := args["name"].(string)
@@ -425,8 +461,9 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 
 	case "list_memories":
 		sourceFilter, _ := args["source"].(string)
+		kindFilter, _ := args["kind"].(string)
 		if s, ok := args["space"].(string); ok && s != "" {
-			names, err := st.ListMemoryNames(s, sourceFilter)
+			names, err := st.ListMemoryNames(s, sourceFilter, kindFilter)
 			if err != nil {
 				return internalErr("list_memories query", err)
 			}
@@ -436,7 +473,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			return textResult(strings.Join(names, "\n"))
 		}
 
-		all, err := st.ListAll(sourceFilter)
+		all, err := st.ListAll(sourceFilter, kindFilter)
 		if err != nil {
 			return internalErr("list_memories query", err)
 		}
@@ -468,7 +505,8 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			limit = 20
 		}
 		sourceFilter, _ := args["source"].(string)
-		matches, err := st.SearchMemories(space, q, limit, searchWeights(), sourceFilter)
+		kindFilter, _ := args["kind"].(string)
+		matches, err := st.SearchMemories(space, q, limit, searchWeights(), sourceFilter, kindFilter)
 		if err != nil {
 			return internalErr("search_memories", err)
 		}
@@ -590,7 +628,7 @@ func resourceURI(space, name string) string {
 var errNotFound = fmt.Errorf("not found")
 
 func listResources() (interface{}, error) {
-	all, err := st.ListAll("")
+	all, err := st.ListAll("", "")
 	if err != nil {
 		log.Printf("resources/list query: %v", err)
 		return nil, fmt.Errorf("internal error")

@@ -101,7 +101,7 @@ func rowsFromAll(all []store.SpaceName) []row {
 			rows = append(rows, row{isHeader: true, space: sn.Space, label: sn.Space})
 			cur = sn.Space
 		}
-		rows = append(rows, row{space: sn.Space, name: sn.Name, label: fmt.Sprintf("%s  (%s)", sn.Name, sn.Source)})
+		rows = append(rows, row{space: sn.Space, name: sn.Name, label: fmt.Sprintf("%s  (%s, %s)", sn.Name, sn.Source, sn.Kind)})
 	}
 	return rows
 }
@@ -123,6 +123,7 @@ type rowsLoadedMsg struct {
 type contentLoadedMsg struct {
 	content string
 	source  string
+	kind    string
 	err     error
 }
 type searchDoneMsg struct {
@@ -150,6 +151,7 @@ const (
 	modeNewName
 	modeNewSpace
 	modeNewSource
+	modeNewKind
 	modeNewContent // waiting on $EDITOR
 )
 
@@ -162,12 +164,14 @@ type model struct {
 
 	content       string
 	currentSource string
+	currentKind   string
 	viewport      viewport.Model
 
 	mode      mode
 	input     textinput.Model
 	newName   string
 	newSpace  string
+	newSource string
 	pending   row // for delete confirmation
 	status    string
 	statusErr bool
@@ -188,7 +192,7 @@ func (m model) Init() tea.Cmd {
 
 func loadRowsCmd(st *store.Store) tea.Cmd {
 	return func() tea.Msg {
-		all, err := st.ListAll("")
+		all, err := st.ListAll("", "")
 		return rowsLoadedMsg{rows: rowsFromAll(all), err: err}
 	}
 }
@@ -196,13 +200,13 @@ func loadRowsCmd(st *store.Store) tea.Cmd {
 func loadContentCmd(st *store.Store, space, name string) tea.Cmd {
 	return func() tea.Msg {
 		meta, err := st.ReassembleMeta(space, name)
-		return contentLoadedMsg{content: meta.Content, source: meta.Source, err: err}
+		return contentLoadedMsg{content: meta.Content, source: meta.Source, kind: meta.Kind, err: err}
 	}
 }
 
 func searchCmd(st *store.Store, space, query string) tea.Cmd {
 	return func() tea.Msg {
-		matches, err := st.SearchMemories(space, query, 10, store.SearchWeights{Semantic: 1.0, HalfLifeDays: 30}, "")
+		matches, err := st.SearchMemories(space, query, 10, store.SearchWeights{Semantic: 1.0, HalfLifeDays: 30}, "", "")
 		return searchDoneMsg{matches: matches, err: err}
 	}
 }
@@ -215,10 +219,10 @@ func deleteCmd(st *store.Store, space, name string) tea.Cmd {
 }
 
 // editCmd suspends the TUI, opens content in $EDITOR against a temp file,
-// and on return reads it back and saves it via the store. source is
+// and on return reads it back and saves it via the store. source/kind are
 // preserved as-is for an edit of an existing memory, or whatever the user
 // entered when creating a new one.
-func editCmd(st *store.Store, space, name, content, source string) tea.Cmd {
+func editCmd(st *store.Store, space, name, content, source, kind string) tea.Cmd {
 	f, err := os.CreateTemp("", "memory-vault-*.md")
 	if err != nil {
 		return func() tea.Msg { return editDoneMsg{err: err} }
@@ -241,7 +245,7 @@ func editCmd(st *store.Store, space, name, content, source string) tea.Cmd {
 		if text == "" {
 			return editDoneMsg{err: fmt.Errorf("empty content, not saved")}
 		}
-		if _, err := st.SaveMemory(space, name, text, source); err != nil {
+		if _, err := st.SaveMemory(space, name, text, source, kind); err != nil {
 			return editDoneMsg{err: err}
 		}
 		return editDoneMsg{space: space, name: name, content: text}
@@ -312,6 +316,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.content = msg.content
 		m.currentSource = msg.source
+		m.currentKind = msg.kind
 		m.viewport.SetContent(msg.content)
 		m.viewport.GotoTop()
 		return m, nil
@@ -366,7 +371,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.mode {
-	case modeSearchInput, modeNewName, modeNewSpace, modeNewSource:
+	case modeSearchInput, modeNewName, modeNewSpace, modeNewSource, modeNewKind:
 		switch msg.String() {
 		case "esc":
 			m.mode = modeBrowse
@@ -404,12 +409,28 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.input.Focus()
 				return m, nil
 			case modeNewSource:
-				source := value
-				if source == "" {
-					source = store.DefaultSource
+				m.newSource = value
+				if m.newSource == "" {
+					m.newSource = store.DefaultSource
+				}
+				m.mode = modeNewKind
+				m.input.SetValue("")
+				m.input.Placeholder = store.DefaultKind
+				m.input.Focus()
+				return m, nil
+			case modeNewKind:
+				kind := value
+				if kind == "" {
+					kind = store.DefaultKind
+				}
+				if !store.IsValidKind(kind) {
+					m.status = fmt.Sprintf("invalid kind %q, want one of: %s", kind, strings.Join(store.ValidKinds, ", "))
+					m.statusErr = true
+					m.input.SetValue("")
+					return m, nil // stay in modeNewKind, re-prompt
 				}
 				m.mode = modeNewContent
-				return m, editCmd(m.st, m.newSpace, m.newName, "", source)
+				return m, editCmd(m.st, m.newSpace, m.newName, "", m.newSource, kind)
 			}
 		}
 		var cmd tea.Cmd
@@ -464,7 +485,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "e":
 			if r, ok := m.selected(); ok {
-				return m, editCmd(m.st, r.space, r.name, m.content, m.currentSource)
+				return m, editCmd(m.st, r.space, r.name, m.content, m.currentSource, m.currentKind)
 			}
 			return m, nil
 		case "d":
@@ -525,6 +546,8 @@ func (m model) View() string {
 		bottom = "space (" + store.DefaultSpace + "): " + m.input.View()
 	case modeNewSource:
 		bottom = "source (" + store.DefaultSource + "): " + m.input.View()
+	case modeNewKind:
+		bottom = "kind (" + store.DefaultKind + ", one of " + strings.Join(store.ValidKinds, "/") + "): " + m.input.View()
 	case modeConfirmDelete:
 		bottom = fmt.Sprintf("delete %q from space %q? (y/N)", m.pending.name, m.pending.space)
 	default:

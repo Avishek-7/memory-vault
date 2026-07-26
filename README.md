@@ -77,12 +77,12 @@ client at `http://localhost:8080/mcp` (see
 
 | Tool | Description |
 |---|---|
-| `save_memory` | Create or overwrite a memory by name. Chunks and embeds the content for semantic search. Optional `source` records who wrote it; optional `expect_source` rejects the write instead of overwriting if it collides with a different source. |
+| `save_memory` | Create or overwrite a memory by name. Chunks and embeds the content for semantic search. Optional `source` records who wrote it; optional `expect_source` rejects the write instead of overwriting if it collides with a different source. Optional `kind` (default `note`) is one of `fact`, `decision`, `preference`, `task`, `note`. |
 | `get_memory` | Fetch a memory's content by exact name. |
-| `list_memories` | List stored memory names. Optional `source` filter. |
-| `search_memories` | Hybrid (semantic + keyword + recency) search, top `limit` matches (default 5, max 20). Optional `source` filter. |
+| `list_memories` | List stored memory names. Optional `source`/`kind` filters. |
+| `search_memories` | Hybrid (semantic + keyword + recency + optional per-kind boost) search, top `limit` matches (default 5, max 20). Optional `source`/`kind` filters. |
 | `delete_memory` | Delete a memory by name. |
-| `compact_memories` | Merge/summarize near-duplicate or stale memories via the local Ollama chat model. |
+| `compact_memories` | Merge/summarize near-duplicate or stale memories via the local Ollama chat model. Never selects `decision`-kind memories. |
 | `export_memories` | Export memories as JSON (no embeddings). Optional `space`/`source`; omit both to export everything. |
 | `import_memories` | Import memories from JSON in the shape `export_memories` produces. Re-chunks/re-embeds through the normal save path. Optional `space`/`source` overrides. |
 
@@ -106,6 +106,26 @@ a memory a different agent wrote under that name. Omit `expect_source` and
 existed. If you want real isolation between agents, use separate `space`s
 instead — spaces are the actual boundary here.
 
+## Kinds
+
+Every memory also carries a `kind`, one of:
+
+| Kind | For |
+|---|---|
+| `fact` | Something true and largely static (a config value, an account detail) |
+| `decision` | Something explicitly decided — an architecture choice, a "we're doing X not Y" |
+| `preference` | How the user/agent wants things done, independent of any one task |
+| `task` | Something in progress or still to do |
+| `note` | Everything else — the default |
+
+It defaults to `note` if omitted, and is validated at the tool boundary —
+an unrecognized value is rejected with the list of valid ones, rather than
+failing deep in a database error. `search_memories` can optionally boost
+matches of a given kind above others at equal similarity via
+`SEARCH_KIND_BOOST_<KIND>` env vars (all default to `0`, so ranking is
+unchanged unless you opt in). See [Compaction](#compaction) for how `kind`
+affects `compact_memories`.
+
 ## Compaction
 
 `compact_memories` keeps the vault from growing unbounded with stale or
@@ -126,10 +146,17 @@ manual/on-demand — there's no background cron. If you want it to run
 automatically, wire a periodic call to the tool into a cron job or an
 n8n/similar workflow.
 
+**Memories of kind `decision` are never compaction candidates** — they're
+excluded before grouping, so a decision can neither be merged into another
+memory nor picked up by staleness pruning, no matter how old or similar to
+something else it is. If you want a decision reconsidered or superseded,
+do that explicitly (`save_memory` a new one, `delete_memory` the old one)
+rather than relying on compaction to do it for you.
+
 ## Export / import
 
-`export_memories` returns a JSON array of `{name, space, source, content,
-updated_at}` — no embeddings, since they're cheap to regenerate on import
+`export_memories` returns a JSON array of `{name, space, source, kind,
+content, updated_at}` — no embeddings, since they're cheap to regenerate on import
 and including them would tie the export to whatever embedding
 model/dimension was active when it was taken. `import_memories` takes
 that same JSON (as its `data` argument) and re-chunks/re-embeds every
@@ -178,7 +205,7 @@ OLLAMA_URL="http://localhost:11434" \
 | `↑`/`k`, `↓`/`j` | Move selection |
 | `/` | Semantic search within the current space |
 | `e` | Edit the selected memory in `$EDITOR` (falls back to `nvim`); saves and re-embeds on exit |
-| `n` | Create a new memory: prompts for name, space, and source (default `unspecified`), then opens `$EDITOR` for content |
+| `n` | Create a new memory: prompts for name, space, source (default `unspecified`), and kind (default `note`, re-prompts on an invalid value), then opens `$EDITOR` for content |
 | `d` | Delete the selected memory (confirm with `y`) |
 | `esc` | Back out of search results / a prompt |
 | `q` | Quit |
@@ -225,6 +252,7 @@ Environment variables:
 | `SEARCH_WEIGHT_KEYWORD` | `0.0` | Weight of full-text (`ts_rank`) similarity |
 | `SEARCH_WEIGHT_RECENCY` | `0.0` | Weight of recency (exponential decay by `updated_at`) |
 | `SEARCH_RECENCY_HALFLIFE_DAYS` | `30` | Half-life, in days, for the recency decay factor |
+| `SEARCH_KIND_BOOST_FACT`, `_DECISION`, `_PREFERENCE`, `_TASK`, `_NOTE` | `0` each | Flat score boost added to matches of that kind in `search_memories` |
 | `COMPACT_SIMILARITY_THRESHOLD` | `0.15` | Cosine-distance threshold under which two memories' embeddings are treated as near-duplicates by `compact_memories` |
 | `COMPACT_STALE_DAYS` | `90` | Age (in days since `updated_at`) past which a lone memory is still a `compact_memories` candidate for solo re-summarization |
 
