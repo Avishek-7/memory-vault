@@ -1,0 +1,20 @@
+[Unit]
+Description=memory-vault encrypted backup
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Copy this file to /etc/systemd/system/, then create
+# /etc/memory-vault-backup.env (chmod 600, root-owned) with:
+#   DATABASE_URL=postgres://...
+#   AGE_RECIPIENT=age1...
+#   BACKUP_GIT_REMOTE=git@example.com:you/memory-vault-backups.git
+# and any of backup.sh's optional overrides (MEMORY_VAULT_BIN,
+# BACKUP_GIT_DIR, BACKUP_GIT_BRANCH, BACKUP_FILE_NAME).
+EnvironmentFile=/etc/memory-vault-backup.env
+ExecStart=/opt/memory-vault/deploy/backup.sh
+# Adjust User/WorkingDirectory to wherever memory-vault is deployed and
+# which account holds the git/SSH credentials for BACKUP_GIT_REMOTE.
+User=avishek
+WorkingDirectory=/opt/memory-vault
