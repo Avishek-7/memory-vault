@@ -77,19 +77,34 @@ client at `http://localhost:8080/mcp` (see
 
 | Tool | Description |
 |---|---|
-| `save_memory` | Create or overwrite a memory by name. Chunks and embeds the content for semantic search. |
+| `save_memory` | Create or overwrite a memory by name. Chunks and embeds the content for semantic search. Optional `source` records who wrote it; optional `expect_source` rejects the write instead of overwriting if it collides with a different source. |
 | `get_memory` | Fetch a memory's content by exact name. |
-| `list_memories` | List stored memory names. |
-| `search_memories` | Hybrid (semantic + keyword + recency) search, top `limit` matches (default 5, max 20). |
+| `list_memories` | List stored memory names. Optional `source` filter. |
+| `search_memories` | Hybrid (semantic + keyword + recency) search, top `limit` matches (default 5, max 20). Optional `source` filter. |
 | `delete_memory` | Delete a memory by name. |
 | `compact_memories` | Merge/summarize near-duplicate or stale memories via the local Ollama chat model. |
-| `export_memories` | Export memories as JSON (no embeddings). Optional `space`; omit it to export everything. |
-| `import_memories` | Import memories from JSON in the shape `export_memories` produces. Re-chunks/re-embeds through the normal save path. |
+| `export_memories` | Export memories as JSON (no embeddings). Optional `space`/`source`; omit both to export everything. |
+| `import_memories` | Import memories from JSON in the shape `export_memories` produces. Re-chunks/re-embeds through the normal save path. Optional `space`/`source` overrides. |
 
 All tools accept an optional `space` argument (default `"default"`) to
 namespace memories — the same `name` can exist independently in different
 spaces. `list_memories` without a `space` lists everything grouped by
 space; with one, it lists just that space's memory names.
+
+## Multiple agents writing to the same vault
+
+Every memory also carries a `source` — a free-form string naming whichever
+agent wrote it (e.g. `"claude-code"`, `"copilot"`, `"n8n"`), defaulting to
+`"unspecified"` if you don't pass one. It's **provenance and
+collision-avoidance, not an access boundary**: anyone with a valid
+`AUTH_TOKEN` can still read or write any source's memories in any space
+they can reach. What it does buy you is protection against silent
+same-name clobbering — pass `expect_source` on `save_memory` and the write
+is rejected (naming the existing source) instead of silently overwriting
+a memory a different agent wrote under that name. Omit `expect_source` and
+`save_memory` overwrites unconditionally, exactly as before this field
+existed. If you want real isolation between agents, use separate `space`s
+instead — spaces are the actual boundary here.
 
 ## Compaction
 
@@ -113,7 +128,7 @@ n8n/similar workflow.
 
 ## Export / import
 
-`export_memories` returns a JSON array of `{name, space, content,
+`export_memories` returns a JSON array of `{name, space, source, content,
 updated_at}` — no embeddings, since they're cheap to regenerate on import
 and including them would tie the export to whatever embedding
 model/dimension was active when it was taken. `import_memories` takes
@@ -124,7 +139,8 @@ whatever `Embedder` is currently configured. By default it skips
 skipped; pass `overwrite: true` to replace them instead. An optional
 `space` argument sends every imported memory there regardless of what's
 recorded in the data — useful for merging a backup into a differently
-named space.
+named space; `source` works the same way (an export taken before the
+`source` field existed imports as `"unspecified"` unless overridden).
 
 Both are also available as CLI subcommands on the `memory-vault` binary
 itself, for scripting a backup without going through an MCP client:
@@ -137,8 +153,9 @@ memory-vault import --file backup.json
 
 `export`/`import` need the same `DATABASE_URL` (and `OLLAMA_URL` or
 `EMBED_PROVIDER=openai` config, for `import`'s re-embedding) as the
-server itself. `import --space other-space --overwrite` mirrors the
-tool's `space`/`overwrite` arguments.
+server itself. `import --space other-space --source other-source
+--overwrite` mirrors the tool's `space`/`source`/`overwrite` arguments;
+`export --source` filters the same way.
 
 ## Browsing memories
 
@@ -161,7 +178,7 @@ OLLAMA_URL="http://localhost:11434" \
 | `↑`/`k`, `↓`/`j` | Move selection |
 | `/` | Semantic search within the current space |
 | `e` | Edit the selected memory in `$EDITOR` (falls back to `nvim`); saves and re-embeds on exit |
-| `n` | Create a new memory: prompts for name and space, then opens `$EDITOR` for content |
+| `n` | Create a new memory: prompts for name, space, and source (default `unspecified`), then opens `$EDITOR` for content |
 | `d` | Delete the selected memory (confirm with `y`) |
 | `esc` | Back out of search results / a prompt |
 | `q` | Quit |

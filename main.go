@@ -10,6 +10,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -191,8 +192,8 @@ type tool struct {
 var tools = []tool{
 	{
 		Name:        "save_memory",
-		Description: "Create or overwrite a memory by name with the given content, optionally in a named space (default: \"default\"). Content is chunked and embedded via Ollama for later semantic search.",
-		InputSchema: schema([]string{"name", "content"}, map[string]string{"name": "string", "content": "string", "space": "string"}),
+		Description: "Create or overwrite a memory by name with the given content, optionally in a named space (default: \"default\"). Content is chunked and embedded via Ollama for later semantic search. Optional source records which agent wrote it (default: \"unspecified\"); optional expect_source rejects the write instead of overwriting if a memory already exists there under a different source.",
+		InputSchema: schema([]string{"name", "content"}, map[string]string{"name": "string", "content": "string", "space": "string", "source": "string", "expect_source": "string"}),
 	},
 	{
 		Name:        "get_memory",
@@ -201,13 +202,13 @@ var tools = []tool{
 	},
 	{
 		Name:        "list_memories",
-		Description: "List the names of stored memories. Pass space to filter to one space; omit it to list all memories grouped by space.",
-		InputSchema: schema(nil, map[string]string{"space": "string"}),
+		Description: "List the names of stored memories. Pass space to filter to one space; omit it to list all memories grouped by space. Optional source filters to memories written by that source.",
+		InputSchema: schema(nil, map[string]string{"space": "string", "source": "string"}),
 	},
 	{
 		Name:        "search_memories",
-		Description: "Hybrid search (semantic + keyword + recency) over stored memories in a space (default: \"default\"). Returns up to `limit` (default 5, max 20) closest matches with their full content.",
-		InputSchema: schema([]string{"query"}, map[string]string{"query": "string", "space": "string", "limit": "number"}),
+		Description: "Hybrid search (semantic + keyword + recency) over stored memories in a space (default: \"default\"). Returns up to `limit` (default 5, max 20) closest matches with their full content. Optional source filters candidates to that source.",
+		InputSchema: schema([]string{"query"}, map[string]string{"query": "string", "space": "string", "limit": "number", "source": "string"}),
 	},
 	{
 		Name:        "delete_memory",
@@ -221,13 +222,13 @@ var tools = []tool{
 	},
 	{
 		Name:        "export_memories",
-		Description: "Export memories as JSON (name, space, content, updated_at — no embeddings, which are cheap to regenerate on import). Optional space exports just that space; omit it to export everything.",
-		InputSchema: schema(nil, map[string]string{"space": "string"}),
+		Description: "Export memories as JSON (name, space, source, content, updated_at — no embeddings, which are cheap to regenerate on import). Optional space exports just that space; optional source exports just that source; omit both to export everything.",
+		InputSchema: schema(nil, map[string]string{"space": "string", "source": "string"}),
 	},
 	{
 		Name:        "import_memories",
-		Description: "Import memories from a JSON payload in the shape export_memories produces. Re-chunks and re-embeds every memory through the normal save path. Optional space sends every imported memory there regardless of what's in the data (useful for merging a backup into a differently-named space); optional overwrite (default false) controls whether memories that already exist are replaced or skipped.",
-		InputSchema: schema([]string{"data"}, map[string]string{"data": "string", "space": "string", "overwrite": "boolean"}),
+		Description: "Import memories from a JSON payload in the shape export_memories produces. Re-chunks and re-embeds every memory through the normal save path. Optional space sends every imported memory there regardless of what's in the data (useful for merging a backup into a differently-named space); optional source does the same for source (otherwise each memory keeps its recorded source, or \"unspecified\" if the export predates the source field); optional overwrite (default false) controls whether memories that already exist are replaced or skipped.",
+		InputSchema: schema([]string{"data"}, map[string]string{"data": "string", "space": "string", "source": "string", "overwrite": "boolean"}),
 	},
 }
 
@@ -360,7 +361,13 @@ func compactGroup(space string, g []store.MemoryCentroid, dryRun bool) (string, 
 	if merged == "" {
 		return "", fmt.Errorf("ollama returned an empty summary")
 	}
-	if _, err := st.SaveMemory(space, newName, merged); err != nil {
+	// A solo re-summarization keeps its source; a multi-source merge has no
+	// single rightful owner, so it's recorded as DefaultSource.
+	mergedSource := store.DefaultSource
+	if len(g) == 1 {
+		mergedSource = g[0].Source
+	}
+	if _, err := st.SaveMemory(space, newName, merged, mergedSource); err != nil {
 		return "", err
 	}
 	for _, m := range g {
@@ -381,14 +388,28 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		n, _ := args["name"].(string)
 		content, _ := args["content"].(string)
 		space := argSpace(args)
+		source, _ := args["source"].(string)
+		if source == "" {
+			source = store.DefaultSource
+		}
 		if n == "" || content == "" {
 			return errResult("name and content are required")
 		}
-		numChunks, err := st.SaveMemory(space, n, content)
+		var numChunks int
+		var err error
+		if expectSource, _ := args["expect_source"].(string); expectSource != "" {
+			numChunks, err = st.SaveMemoryExpectSource(space, n, content, source, expectSource)
+			var conflict *store.SourceConflictError
+			if errors.As(err, &conflict) {
+				return errResult(fmt.Sprintf("memory %q in space %q already exists with source %q, not %q — refusing to overwrite", n, space, conflict.Existing, expectSource))
+			}
+		} else {
+			numChunks, err = st.SaveMemory(space, n, content, source)
+		}
 		if err != nil {
 			return internalErr("save_memory", err)
 		}
-		return textResult(fmt.Sprintf("saved memory %q in space %q (%d bytes, %d chunk(s))", n, space, len(content), numChunks))
+		return textResult(fmt.Sprintf("saved memory %q in space %q (source %q, %d bytes, %d chunk(s))", n, space, source, len(content), numChunks))
 
 	case "get_memory":
 		n, _ := args["name"].(string)
@@ -403,8 +424,9 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		return textResult(content)
 
 	case "list_memories":
+		sourceFilter, _ := args["source"].(string)
 		if s, ok := args["space"].(string); ok && s != "" {
-			names, err := st.ListMemoryNames(s)
+			names, err := st.ListMemoryNames(s, sourceFilter)
 			if err != nil {
 				return internalErr("list_memories query", err)
 			}
@@ -414,7 +436,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			return textResult(strings.Join(names, "\n"))
 		}
 
-		all, err := st.ListAll()
+		all, err := st.ListAll(sourceFilter)
 		if err != nil {
 			return internalErr("list_memories query", err)
 		}
@@ -445,7 +467,8 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		if limit > 20 {
 			limit = 20
 		}
-		matches, err := st.SearchMemories(space, q, limit, searchWeights())
+		sourceFilter, _ := args["source"].(string)
+		matches, err := st.SearchMemories(space, q, limit, searchWeights(), sourceFilter)
 		if err != nil {
 			return internalErr("search_memories", err)
 		}
@@ -514,7 +537,8 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 
 	case "export_memories":
 		space, _ := args["space"].(string)
-		items, err := st.Export(space)
+		source, _ := args["source"].(string)
+		items, err := st.Export(space, source)
 		if err != nil {
 			return internalErr("export_memories", err)
 		}
@@ -534,8 +558,9 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			return errResult("data is not valid export JSON: " + err.Error())
 		}
 		spaceOverride, _ := args["space"].(string)
+		sourceOverride, _ := args["source"].(string)
 		overwrite, _ := args["overwrite"].(bool)
-		res, err := st.Import(items, spaceOverride, overwrite)
+		res, err := st.Import(items, spaceOverride, sourceOverride, overwrite)
 		if err != nil {
 			return internalErr("import_memories", err)
 		}
@@ -565,7 +590,7 @@ func resourceURI(space, name string) string {
 var errNotFound = fmt.Errorf("not found")
 
 func listResources() (interface{}, error) {
-	all, err := st.ListAll()
+	all, err := st.ListAll("")
 	if err != nil {
 		log.Printf("resources/list query: %v", err)
 		return nil, fmt.Errorf("internal error")
@@ -772,9 +797,10 @@ func mcpHandler(w http.ResponseWriter, r *http.Request) {
 func runExportCLI(args []string) {
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
 	space := fs.String("space", "", "space to export (all spaces if omitted)")
+	source := fs.String("source", "", "source to export (all sources if omitted)")
 	fs.Parse(args)
 
-	items, err := st.Export(*space)
+	items, err := st.Export(*space, *source)
 	if err != nil {
 		log.Fatalf("export: %v", err)
 	}
@@ -789,6 +815,7 @@ func runImportCLI(args []string) {
 	fs := flag.NewFlagSet("import", flag.ExitOnError)
 	file := fs.String("file", "", "JSON file to import (reads stdin if omitted)")
 	space := fs.String("space", "", "send every imported memory to this space, overriding what's in the data")
+	source := fs.String("source", "", "send every imported memory to this source, overriding what's in the data")
 	overwrite := fs.Bool("overwrite", false, "overwrite existing (space, name) pairs instead of skipping them")
 	fs.Parse(args)
 
@@ -805,7 +832,7 @@ func runImportCLI(args []string) {
 	if err := json.NewDecoder(r).Decode(&items); err != nil {
 		log.Fatalf("import: invalid JSON: %v", err)
 	}
-	res, err := st.Import(items, *space, *overwrite)
+	res, err := st.Import(items, *space, *source, *overwrite)
 	if err != nil {
 		log.Fatalf("import: %v", err)
 	}

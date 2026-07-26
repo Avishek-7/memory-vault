@@ -33,6 +33,11 @@ const chunkOverlapWords = 15
 
 const DefaultSpace = "default"
 
+// DefaultSource is recorded on a memory when no source is given — it's
+// provenance metadata (which agent wrote it), not an isolation boundary
+// like space.
+const DefaultSource = "unspecified"
+
 // migrationSQL is templated on the embedding dimension so a non-default
 // EMBED_DIM is reflected in the vector column at table-creation time.
 func migrationSQL(dim int) string {
@@ -49,6 +54,7 @@ func migrationSQL(dim int) string {
 		);
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS chunk_index INT NOT NULL DEFAULT 0;
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS space TEXT NOT NULL DEFAULT 'default';
+		ALTER TABLE memories ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'unspecified';
 		DO $$
 		BEGIN
 			IF (SELECT array_length(conkey, 1) FROM pg_constraint
@@ -228,35 +234,78 @@ func CosineDistance(a, b []float64) float64 {
 	return 1 - dot/(math.Sqrt(na)*math.Sqrt(nb))
 }
 
+// MemoryMeta is a reassembled memory's content plus its descriptive
+// metadata (source today; kind/flags join it in later phases).
+type MemoryMeta struct {
+	Content string
+	Source  string
+}
+
+// ReassembleMeta fetches all chunks for (space, name) ordered by chunk_index,
+// joins their content back into the original text, and returns the memory's
+// source alongside it. Returns a zero MemoryMeta with no error if the memory
+// doesn't exist.
+func (s *Store) ReassembleMeta(space, name string) (MemoryMeta, error) {
+	rows, err := s.DB.Query(`SELECT content, source FROM memories WHERE space = $1 AND name = $2 ORDER BY chunk_index`, space, name)
+	if err != nil {
+		return MemoryMeta{}, err
+	}
+	defer rows.Close()
+	var parts []string
+	var source string
+	for rows.Next() {
+		var c, src string
+		if err := rows.Scan(&c, &src); err != nil {
+			return MemoryMeta{}, err
+		}
+		parts = append(parts, c)
+		source = src
+	}
+	return MemoryMeta{Content: strings.Join(parts, " "), Source: source}, rows.Err()
+}
+
 // Reassemble fetches all chunks for (space, name) ordered by chunk_index
 // and joins them back into the original content. Returns "" with no error
 // if the memory doesn't exist.
 func (s *Store) Reassemble(space, name string) (string, error) {
-	rows, err := s.DB.Query(`SELECT content FROM memories WHERE space = $1 AND name = $2 ORDER BY chunk_index`, space, name)
-	if err != nil {
-		return "", err
-	}
-	defer rows.Close()
-	var parts []string
-	for rows.Next() {
-		var c string
-		if err := rows.Scan(&c); err != nil {
-			return "", err
-		}
-		parts = append(parts, c)
-	}
-	return strings.Join(parts, " "), rows.Err()
+	meta, err := s.ReassembleMeta(space, name)
+	return meta.Content, err
+}
+
+// SourceConflictError is returned by SaveMemoryExpectSource when the
+// caller's expectSource doesn't match an existing memory's recorded source.
+type SourceConflictError struct {
+	Existing string
+}
+
+func (e *SourceConflictError) Error() string {
+	return fmt.Sprintf("existing memory has source %q", e.Existing)
 }
 
 // SaveMemory chunks, embeds, and (re)writes content under (space, name),
 // replacing any existing chunks for that name. Returns the chunk count.
-func (s *Store) SaveMemory(space, name, content string) (int, error) {
-	wrote, chunks, err := s.saveMemory(space, name, content, true)
-	if err != nil {
-		return 0, err
+// An empty source is recorded as DefaultSource.
+func (s *Store) SaveMemory(space, name, content, source string) (int, error) {
+	if source == "" {
+		source = DefaultSource
 	}
-	_ = wrote // always true when overwrite is true
-	return chunks, nil
+	_, chunks, err := s.saveMemory(space, name, content, source, true, "")
+	return chunks, err
+}
+
+// SaveMemoryExpectSource is SaveMemory, but first checks (within the same
+// transaction, row-locked to close the race) whether a memory already
+// exists at (space, name) with a different source. If so, it returns a
+// *SourceConflictError instead of overwriting it — this is how two
+// differently-sourced agents avoid silently clobbering each other's
+// same-named memory. An empty expectSource skips the check entirely
+// (SaveMemory's behavior).
+func (s *Store) SaveMemoryExpectSource(space, name, content, source, expectSource string) (int, error) {
+	if source == "" {
+		source = DefaultSource
+	}
+	_, chunks, err := s.saveMemory(space, name, content, source, true, expectSource)
+	return chunks, err
 }
 
 // isUniqueViolation reports whether err is a Postgres unique-constraint
@@ -276,13 +325,29 @@ func isUniqueViolation(err error) bool {
 // concurrent writer could race between) — a conflict there, whether from
 // a memory that already existed before this call or one written by a
 // concurrent caller mid-transaction, means wrote=false with no error.
-func (s *Store) saveMemory(space, name, content string, overwrite bool) (wrote bool, chunks int, err error) {
+//
+// If expectSource is non-empty, an existing memory at (space, name) is
+// row-locked and its source compared against expectSource before any
+// write happens; a mismatch returns a *SourceConflictError and writes
+// nothing.
+func (s *Store) saveMemory(space, name, content, source string, overwrite bool, expectSource string) (wrote bool, chunks int, err error) {
 	chunkList := ChunkContent(content)
 	tx, err := s.DB.Begin()
 	if err != nil {
 		return false, 0, err
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
+
+	if expectSource != "" {
+		var existing string
+		err := tx.QueryRow(`SELECT source FROM memories WHERE space = $1 AND name = $2 LIMIT 1 FOR UPDATE`, space, name).Scan(&existing)
+		if err != nil && err != sql.ErrNoRows {
+			return false, 0, err
+		}
+		if err == nil && existing != expectSource {
+			return false, 0, &SourceConflictError{Existing: existing}
+		}
+	}
 
 	if overwrite {
 		if _, err := tx.Exec(`DELETE FROM memories WHERE space = $1 AND name = $2`, space, name); err != nil {
@@ -295,9 +360,9 @@ func (s *Store) saveMemory(space, name, content string, overwrite bool) (wrote b
 			return false, 0, err
 		}
 		_, err = tx.Exec(`
-			INSERT INTO memories (space, name, chunk_index, content, embedding, updated_at)
-			VALUES ($1, $2, $3, $4, $5::vector, now())
-		`, space, name, i, chunk, VectorLiteral(vec))
+			INSERT INTO memories (space, name, chunk_index, content, embedding, source, updated_at)
+			VALUES ($1, $2, $3, $4, $5::vector, $6, now())
+		`, space, name, i, chunk, VectorLiteral(vec), source)
 		if err != nil {
 			if !overwrite && isUniqueViolation(err) {
 				return false, 0, nil
@@ -322,9 +387,17 @@ func (s *Store) DeleteMemory(space, name string) (bool, error) {
 	return affected > 0, err
 }
 
-// ListMemoryNames lists the distinct memory names within a space.
-func (s *Store) ListMemoryNames(space string) ([]string, error) {
-	rows, err := s.DB.Query(`SELECT DISTINCT name FROM memories WHERE space = $1 ORDER BY name`, space)
+// ListMemoryNames lists the distinct memory names within a space, optionally
+// filtered to those with the given source (source == "" means no filter).
+func (s *Store) ListMemoryNames(space, source string) ([]string, error) {
+	query := `SELECT DISTINCT name FROM memories WHERE space = $1`
+	args := []interface{}{space}
+	if source != "" {
+		query += ` AND source = $2`
+		args = append(args, source)
+	}
+	query += ` ORDER BY name`
+	rows, err := s.DB.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -341,14 +414,23 @@ func (s *Store) ListMemoryNames(space string) ([]string, error) {
 }
 
 type SpaceName struct {
-	Space string
-	Name  string
+	Space  string
+	Name   string
+	Source string
 }
 
 // ListAll lists every (space, name) pair across all spaces, ordered by
-// space then name.
-func (s *Store) ListAll() ([]SpaceName, error) {
-	rows, err := s.DB.Query(`SELECT DISTINCT space, name FROM memories ORDER BY space, name`)
+// space then name, optionally filtered to a source (source == "" means no
+// filter).
+func (s *Store) ListAll(source string) ([]SpaceName, error) {
+	query := `SELECT DISTINCT space, name, source FROM memories`
+	var args []interface{}
+	if source != "" {
+		query += ` WHERE source = $1`
+		args = append(args, source)
+	}
+	query += ` ORDER BY space, name`
+	rows, err := s.DB.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -356,7 +438,7 @@ func (s *Store) ListAll() ([]SpaceName, error) {
 	var out []SpaceName
 	for rows.Next() {
 		var sn SpaceName
-		if err := rows.Scan(&sn.Space, &sn.Name); err != nil {
+		if err := rows.Scan(&sn.Space, &sn.Name, &sn.Source); err != nil {
 			return nil, err
 		}
 		out = append(out, sn)
@@ -399,21 +481,27 @@ type SearchMatch struct {
 
 // SearchMemories runs hybrid (semantic + keyword + recency) search within a
 // space and returns up to limit matches, highest score first, with each
-// match's content already reassembled.
-func (s *Store) SearchMemories(space, query string, limit int, w SearchWeights) ([]SearchMatch, error) {
+// match's content already reassembled. An optional source filters candidates
+// to that source only ("" means no filter).
+func (s *Store) SearchMemories(space, query string, limit int, w SearchWeights, source string) ([]SearchMatch, error) {
 	vec, err := s.Embed(query)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.DB.Query(`
+	sqlQuery := `
 		SELECT name, embedding <=> $1::vector AS distance,
 		       ts_rank(content_tsv, plainto_tsquery('english', $2)) AS rank,
 		       updated_at
 		FROM memories
-		WHERE space = $3
-		ORDER BY distance ASC
-		LIMIT $4
-	`, VectorLiteral(vec), query, space, limit*5)
+		WHERE space = $3`
+	args := []interface{}{VectorLiteral(vec), query, space}
+	if source != "" {
+		sqlQuery += ` AND source = $4`
+		args = append(args, source)
+	}
+	sqlQuery += fmt.Sprintf(` ORDER BY distance ASC LIMIT $%d`, len(args)+1)
+	args = append(args, limit*5)
+	rows, err := s.DB.Query(sqlQuery, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -466,30 +554,32 @@ func (s *Store) SearchMemories(space, query string, limit int, w SearchWeights) 
 // used by compact_memories to find near-duplicate or stale candidates.
 type MemoryCentroid struct {
 	Name        string
+	Source      string
 	Centroid    []float64
 	LastUpdated time.Time
 }
 
 // MemoryCentroids returns every memory name in a space with its centroid
-// embedding (the average of its chunk embeddings) and most recent update time.
+// embedding (the average of its chunk embeddings), source, and most recent
+// update time.
 func (s *Store) MemoryCentroids(space string) ([]MemoryCentroid, error) {
-	rows, err := s.DB.Query(`SELECT name, avg(embedding)::text, max(updated_at) FROM memories WHERE space = $1 GROUP BY name`, space)
+	rows, err := s.DB.Query(`SELECT name, max(source), avg(embedding)::text, max(updated_at) FROM memories WHERE space = $1 GROUP BY name`, space)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []MemoryCentroid
 	for rows.Next() {
-		var name, centroidStr string
+		var name, source, centroidStr string
 		var lastUpdated time.Time
-		if err := rows.Scan(&name, &centroidStr, &lastUpdated); err != nil {
+		if err := rows.Scan(&name, &source, &centroidStr, &lastUpdated); err != nil {
 			return nil, err
 		}
 		centroid, err := ParseVectorLiteral(centroidStr)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, MemoryCentroid{Name: name, Centroid: centroid, LastUpdated: lastUpdated})
+		out = append(out, MemoryCentroid{Name: name, Source: source, Centroid: centroid, LastUpdated: lastUpdated})
 	}
 	return out, rows.Err()
 }
@@ -500,18 +590,28 @@ func (s *Store) MemoryCentroids(space string) ([]MemoryCentroid, error) {
 type MemoryExport struct {
 	Name      string    `json:"name"`
 	Space     string    `json:"space"`
+	Source    string    `json:"source,omitempty"`
 	Content   string    `json:"content"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Export reassembles every memory in space into its portable form,
-// ordered by space then name. Exports every space if space == "".
-func (s *Store) Export(space string) ([]MemoryExport, error) {
-	query := `SELECT space, name, content, updated_at FROM memories`
+// ordered by space then name. Exports every space if space == "", and
+// every source if source == "".
+func (s *Store) Export(space, source string) ([]MemoryExport, error) {
+	query := `SELECT space, name, source, content, updated_at FROM memories`
+	var clauses []string
 	var args []interface{}
 	if space != "" {
-		query += ` WHERE space = $1`
 		args = append(args, space)
+		clauses = append(clauses, fmt.Sprintf("space = $%d", len(args)))
+	}
+	if source != "" {
+		args = append(args, source)
+		clauses = append(clauses, fmt.Sprintf("source = $%d", len(args)))
+	}
+	if len(clauses) > 0 {
+		query += ` WHERE ` + strings.Join(clauses, " AND ")
 	}
 	query += ` ORDER BY space, name, chunk_index`
 	rows, err := s.DB.Query(query, args...)
@@ -522,15 +622,15 @@ func (s *Store) Export(space string) ([]MemoryExport, error) {
 
 	var out []MemoryExport
 	for rows.Next() {
-		var sp, name, content string
+		var sp, name, src, content string
 		var updatedAt time.Time
-		if err := rows.Scan(&sp, &name, &content, &updatedAt); err != nil {
+		if err := rows.Scan(&sp, &name, &src, &content, &updatedAt); err != nil {
 			return nil, err
 		}
 		if n := len(out); n > 0 && out[n-1].Space == sp && out[n-1].Name == name {
 			out[n-1].Content += " " + content // rejoin chunks, same as Reassemble
 		} else {
-			out = append(out, MemoryExport{Space: sp, Name: name, Content: content, UpdatedAt: updatedAt})
+			out = append(out, MemoryExport{Space: sp, Name: name, Source: src, Content: content, UpdatedAt: updatedAt})
 		}
 	}
 	return out, rows.Err()
@@ -549,9 +649,11 @@ type ImportResult struct {
 // currently configured are applied consistently rather than writing rows
 // directly. spaceOverride, if non-empty, sends every memory to that
 // space regardless of what's recorded in data; otherwise each memory
-// keeps its own recorded space. A (space, name) pair that already exists
-// is skipped unless overwrite is true.
-func (s *Store) Import(data []MemoryExport, spaceOverride string, overwrite bool) (ImportResult, error) {
+// keeps its own recorded space. sourceOverride works the same way for
+// source; a memory whose export predates the source field (or has one
+// blank) falls back to DefaultSource. A (space, name) pair that already
+// exists is skipped unless overwrite is true.
+func (s *Store) Import(data []MemoryExport, spaceOverride, sourceOverride string, overwrite bool) (ImportResult, error) {
 	var res ImportResult
 	for _, m := range data {
 		space := m.Space
@@ -561,7 +663,14 @@ func (s *Store) Import(data []MemoryExport, spaceOverride string, overwrite bool
 		if space == "" {
 			space = DefaultSpace
 		}
-		wrote, _, err := s.saveMemory(space, m.Name, m.Content, overwrite)
+		source := m.Source
+		if sourceOverride != "" {
+			source = sourceOverride
+		}
+		if source == "" {
+			source = DefaultSource
+		}
+		wrote, _, err := s.saveMemory(space, m.Name, m.Content, source, overwrite, "")
 		if err != nil {
 			return res, err
 		}

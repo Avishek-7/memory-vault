@@ -8,19 +8,19 @@ import (
 
 func TestRowsFromAll(t *testing.T) {
 	rows := rowsFromAll([]store.SpaceName{
-		{Space: "default", Name: "a"},
-		{Space: "default", Name: "b"},
-		{Space: "work", Name: "c"},
+		{Space: "default", Name: "a", Source: "unspecified"},
+		{Space: "default", Name: "b", Source: "unspecified"},
+		{Space: "work", Name: "c", Source: "claude-code"},
 	})
 	want := []struct {
 		isHeader bool
 		label    string
 	}{
 		{true, "default"},
-		{false, "a"},
-		{false, "b"},
+		{false, "a  (unspecified)"},
+		{false, "b  (unspecified)"},
 		{true, "work"},
-		{false, "c"},
+		{false, "c  (claude-code)"},
 	}
 	if len(rows) != len(want) {
 		t.Fatalf("rowsFromAll: got %d rows, want %d", len(rows), len(want))
