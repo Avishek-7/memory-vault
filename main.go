@@ -878,7 +878,7 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if _, err := st.DB.Exec("SELECT 1"); err != nil {
+	if err := st.Ping(); err != nil {
 		log.Printf("healthz: db ping failed: %v", err)
 		w.WriteHeader(http.StatusServiceUnavailable)
 		json.NewEncoder(w).Encode(map[string]string{"status": "error", "db": "unreachable"})
