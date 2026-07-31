@@ -255,6 +255,36 @@ Every stored memory is also browsable as an MCP resource
 - Postgres with the `vector` extension available (e.g. `pgvector/pgvector:pg16`)
 - Ollama running with `all-minilm` pulled (`ollama pull all-minilm`), reachable from wherever this server runs
 - Go 1.26+ to build
+- **An unprivileged Postgres role for the server to connect as** — see [Database roles and tenant isolation](#database-roles-and-tenant-isolation)
+
+## Database roles and tenant isolation
+
+Memories are isolated per tenant by Postgres row-level security, not by
+application code remembering to filter correctly. Every table storing
+per-tenant data carries a `tenant_id`, and a policy on `memories` filters
+every statement on `current_setting('app.tenant_id')`, which the storage
+layer binds to a transaction before any query runs.
+
+**This only works if the server connects as a role that cannot bypass RLS.**
+Superusers and `BYPASSRLS` roles ignore policies entirely — including
+`FORCE ROW LEVEL SECURITY` — which would leave isolation fully configured
+and enforcing nothing. Because `POSTGRES_USER` in the standard Postgres
+image creates a *superuser*, the obvious setup lands in exactly that state,
+so the server refuses to start rather than serve a boundary that isn't there.
+
+`deploy/init-db.sql` provisions the extension and the unprivileged role;
+`docker-compose.yml` applies it automatically when the data directory is
+first created. Applying it to an existing database by hand:
+
+```bash
+psql "$SUPERUSER_DATABASE_URL" -f deploy/init-db.sql
+```
+
+then point `DATABASE_URL` at `memory_vault_app` rather than the superuser.
+
+Rows written before multi-tenancy are adopted by a bootstrap tenant
+(`00000000-0000-0000-0000-000000000001`) during migration, so an existing
+single-tenant vault keeps working with no configuration change.
 
 ## Configuration
 
@@ -262,7 +292,7 @@ Environment variables:
 
 | Var | Default | Description |
 |---|---|---|
-| `DATABASE_URL` | *(required)* | Postgres connection string, e.g. `postgres://user:pass@host:5432/dbname?sslmode=disable` |
+| `DATABASE_URL` | *(required)* | Postgres connection string, e.g. `postgres://user:pass@host:5432/dbname?sslmode=disable`. Must name a role that is **not** a superuser and lacks `BYPASSRLS` — see [Database roles and tenant isolation](#database-roles-and-tenant-isolation) |
 | `OLLAMA_URL` | `http://localhost:11434` | Base URL of the Ollama server |
 | `OLLAMA_EMBED_MODEL` | `all-minilm` | Ollama embedding model name |
 | `OLLAMA_CHAT_MODEL` | `llama3.1:8b` | Ollama chat model used only by `compact_memories` |

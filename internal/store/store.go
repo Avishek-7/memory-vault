@@ -76,8 +76,15 @@ func IsValidFlag(f string) bool {
 	return false
 }
 
+// BootstrapTenantID owns every row that existed before multi-tenancy. A
+// fixed sentinel rather than a generated UUID keeps the migration purely
+// idempotent and means a self-hosted single-tenant deploy needs no new
+// configuration to keep working after upgrading.
+const BootstrapTenantID = "00000000-0000-0000-0000-000000000001"
+
 // migrationSQL is templated on the embedding dimension so a non-default
-// EMBED_DIM is reflected in the vector column at table-creation time.
+// EMBED_DIM is reflected in the vector column at table-creation time, and
+// on BootstrapTenantID for the backfill of pre-multi-tenant rows.
 func migrationSQL(dim int) string {
 	return fmt.Sprintf(`
 		CREATE EXTENSION IF NOT EXISTS vector;
@@ -86,7 +93,7 @@ func migrationSQL(dim int) string {
 			name        TEXT NOT NULL,
 			chunk_index INT NOT NULL DEFAULT 0,
 			content     TEXT NOT NULL,
-			embedding   vector(%d) NOT NULL,
+			embedding   vector(%[1]d) NOT NULL,
 			updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
 			PRIMARY KEY (space, name, chunk_index)
 		);
@@ -97,20 +104,60 @@ func migrationSQL(dim int) string {
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS flag TEXT;
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS flagged_at TIMESTAMPTZ;
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS flag_note TEXT;
+		CREATE TABLE IF NOT EXISTS tenants (
+			id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+			email              TEXT NOT NULL UNIQUE,
+			plan               TEXT NOT NULL DEFAULT 'free' CHECK (plan IN ('free','builder','team')),
+			created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+			stripe_customer_id TEXT UNIQUE
+		);
+		INSERT INTO tenants (id, email, plan)
+			VALUES ('%[2]s', 'self-hosted@localhost', 'team')
+			ON CONFLICT (id) DO NOTHING;
+
+		ALTER TABLE memories ADD COLUMN IF NOT EXISTS tenant_id uuid;
+		UPDATE memories SET tenant_id = '%[2]s' WHERE tenant_id IS NULL;
+		ALTER TABLE memories ALTER COLUMN tenant_id SET NOT NULL;
+		-- Defaulting tenant_id from the session variable means no INSERT in
+		-- this package names the column; the RLS WITH CHECK below still
+		-- rejects any row that would land under the wrong tenant.
+		ALTER TABLE memories ALTER COLUMN tenant_id
+			SET DEFAULT current_setting('app.tenant_id')::uuid;
+		ALTER TABLE memories DROP CONSTRAINT IF EXISTS memories_tenant_id_fkey;
+		ALTER TABLE memories ADD CONSTRAINT memories_tenant_id_fkey
+			FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE;
+
 		DO $$
 		BEGIN
 			IF (SELECT array_length(conkey, 1) FROM pg_constraint
-				WHERE conrelid = 'memories'::regclass AND contype = 'p') < 3 THEN
+				WHERE conrelid = 'memories'::regclass AND contype = 'p') < 4 THEN
 				ALTER TABLE memories DROP CONSTRAINT memories_pkey;
-				ALTER TABLE memories ADD PRIMARY KEY (space, name, chunk_index);
+				ALTER TABLE memories ADD PRIMARY KEY (tenant_id, space, name, chunk_index);
 			END IF;
 		END $$;
+
+		-- FORCE is load-bearing: the app connects as the table owner, and
+		-- owners bypass ENABLE-only RLS. Without it the policy below would
+		-- read as correct and enforce nothing.
+		ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
+		ALTER TABLE memories FORCE ROW LEVEL SECURITY;
+		DROP POLICY IF EXISTS memories_tenant_isolation ON memories;
+		CREATE POLICY memories_tenant_isolation ON memories
+			USING      (tenant_id = current_setting('app.tenant_id')::uuid)
+			WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid);
+
+		-- ponytail: one shared HNSW index across all tenants. A vector scan
+		-- finds the global top-k and RLS filters it afterwards, so a tenant
+		-- sharing the index with noisier neighbours can get back fewer
+		-- than the requested limit. Fix is pgvector 0.8 iterative scans
+		-- (hnsw.iterative_scan) or per-tenant partitioning, once there is
+		-- enough multi-tenant data to measure the recall loss.
 		CREATE INDEX IF NOT EXISTS memories_embedding_idx
 			ON memories USING hnsw (embedding vector_cosine_ops);
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS content_tsv tsvector
 			GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
 		CREATE INDEX IF NOT EXISTS memories_content_tsv_idx ON memories USING GIN (content_tsv);
-	`, dim)
+	`, dim, BootstrapTenantID)
 }
 
 // Config configures a Store: how to reach Postgres and which Embedder to
@@ -129,11 +176,107 @@ type Config struct {
 	ConnMaxLifetime time.Duration
 }
 
+// tenantDB is the only route this package has to Postgres for tenant data.
+// Every call runs inside a transaction that has already bound
+// app.tenant_id, which is what the memories RLS policy filters on — so
+// isolation is enforced by Postgres on every statement rather than by each
+// query remembering to filter correctly.
+//
+// The field is unexported and Store exposes no *sql.DB, so there is no way
+// to reach the pool from outside this package and skip the binding.
+type tenantDB struct {
+	pool   *sql.DB
+	tenant string
+}
+
+// begin starts a transaction with app.tenant_id bound to it.
+//
+// set_config's third argument is is_local: the setting is scoped to this
+// transaction and disappears on commit or rollback, so a connection
+// returning to the pool can never carry one tenant's id into another
+// tenant's query. It is also the parameterized form — plain SET LOCAL
+// cannot take a bind parameter, and interpolating the tenant id into
+// statement text would reintroduce the injection vector RLS exists to close.
+func (t *tenantDB) begin() (*sql.Tx, error) {
+	tx, err := t.pool.Begin()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`SELECT set_config('app.tenant_id', $1, true)`, t.tenant); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("binding app.tenant_id: %w", err)
+	}
+	return tx, nil
+}
+
+// Begin exposes a tenant-bound transaction for callers that need several
+// statements to be atomic (saveMemory).
+func (t *tenantDB) Begin() (*sql.Tx, error) { return t.begin() }
+
+func (t *tenantDB) Exec(query string, args ...interface{}) (sql.Result, error) {
+	tx, err := t.begin()
+	if err != nil {
+		return nil, err
+	}
+	res, err := tx.Exec(query, args...)
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	return res, tx.Commit()
+}
+
+// tenantRows is *sql.Rows that also owns the transaction it is being read
+// from. Callers keep their usual `defer rows.Close()` and never have to
+// know a transaction is involved.
+type tenantRows struct {
+	*sql.Rows
+	tx *sql.Tx
+}
+
+func (r *tenantRows) Close() error {
+	err := r.Rows.Close()
+	// These transactions only ever run SELECTs, so rollback and commit are
+	// equivalent — and rollback is the right call if the caller broke out
+	// of iteration early.
+	if rbErr := r.tx.Rollback(); err == nil && rbErr != nil && rbErr != sql.ErrTxDone {
+		err = rbErr
+	}
+	return err
+}
+
+func (t *tenantDB) Query(query string, args ...interface{}) (*tenantRows, error) {
+	tx, err := t.begin()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(query, args...)
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	return &tenantRows{Rows: rows, tx: tx}, nil
+}
+
 type Store struct {
-	DB       *sql.DB
+	db       *tenantDB
 	Embedder embed.Embedder
 	EmbedDim int
 }
+
+// ForTenant returns a copy of s whose queries run as the given tenant. It
+// shares the underlying pool and opens no connection, so it is cheap enough
+// to call per request — which is what the API-key middleware will do once
+// the tenant id comes from a key lookup rather than from Open's default.
+func (s *Store) ForTenant(tenantID string) *Store {
+	scoped := *s
+	scoped.db = &tenantDB{pool: s.db.pool, tenant: tenantID}
+	return &scoped
+}
+
+// Ping reports whether Postgres is reachable, for the /healthz readiness
+// check. It touches no tenant data, so it needs no tenant binding.
+func (s *Store) Ping() error { return s.db.pool.Ping() }
 
 // Open connects to Postgres, applies pool settings, and runs the (idempotent)
 // schema migration.
@@ -159,13 +302,76 @@ func Open(cfg Config) (*Store, error) {
 	db.SetMaxOpenConns(cfg.MaxOpenConns)
 	db.SetMaxIdleConns(cfg.MaxIdleConns)
 	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
-	if _, err := db.Exec(migrationSQL(dim)); err != nil {
+	if err := checkRLSEnforceable(db); err != nil {
+		return nil, err
+	}
+	if err := migrate(db, dim); err != nil {
 		return nil, err
 	}
 	if err := checkEmbedDim(db, dim); err != nil {
 		return nil, err
 	}
-	return &Store{DB: db, Embedder: embedder, EmbedDim: dim}, nil
+	// Default to the bootstrap tenant, which owns every row written before
+	// multi-tenancy — so a single-tenant deploy behaves exactly as it did.
+	// Per-request scoping comes from ForTenant.
+	return &Store{
+		db:       &tenantDB{pool: db, tenant: BootstrapTenantID},
+		Embedder: embedder,
+		EmbedDim: dim,
+	}, nil
+}
+
+// migrate applies the idempotent schema migration in a single transaction.
+//
+// app.tenant_id has to be bound first: on a second and later startup the
+// memories RLS policy is already in place, so the backfill UPDATE would
+// otherwise fail on an unset setting. Wrapping the whole thing in one
+// transaction also means a migration that fails partway — during the
+// primary-key swap, say — leaves the schema untouched rather than halfway.
+func migrate(db *sql.DB, dim int) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`SELECT set_config('app.tenant_id', $1, true)`, BootstrapTenantID); err != nil {
+		return fmt.Errorf("binding app.tenant_id for migration: %w", err)
+	}
+	if _, err := tx.Exec(migrationSQL(dim)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// checkRLSEnforceable refuses to start if the connecting role can bypass
+// row-level security. Superusers and BYPASSRLS roles ignore policies
+// outright — even FORCE ROW LEVEL SECURITY — so tenant isolation would be
+// fully configured and enforcing nothing, with no symptom until one tenant
+// reads another's memories.
+//
+// This is a startup error rather than a warning on purpose: a log line about
+// a security boundary that is silently off is a log line nobody reads. Note
+// that POSTGRES_USER in the standard postgres image creates a superuser, so
+// the obvious setup lands in exactly this state.
+func checkRLSEnforceable(db *sql.DB) error {
+	var role string
+	var super, bypass bool
+	err := db.QueryRow(
+		`SELECT current_user, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user`,
+	).Scan(&role, &super, &bypass)
+	if err != nil {
+		return fmt.Errorf("checking whether row-level security is enforceable: %w", err)
+	}
+	if !super && !bypass {
+		return nil
+	}
+	return fmt.Errorf(
+		"database role %q is a superuser or has BYPASSRLS, so the tenant isolation "+
+			"policy on memories cannot be enforced — every tenant would be able to read "+
+			"every other tenant's data. Connect as an unprivileged role instead:\n"+
+			"    CREATE ROLE memory_vault_app LOGIN PASSWORD '...';\n"+
+			"    GRANT ALL ON SCHEMA public TO memory_vault_app;\n"+
+			"and point DATABASE_URL at it (see deploy/init-db.sql)", role)
 }
 
 // checkEmbedDim fails fast, with a clear message, if memories.embedding
@@ -192,7 +398,7 @@ func checkEmbedDim(db *sql.DB, dim int) error {
 	return nil
 }
 
-func (s *Store) Close() error { return s.DB.Close() }
+func (s *Store) Close() error { return s.db.pool.Close() }
 
 // ChunkContent splits content into overlapping word-based chunks that
 // safely fit all-minilm's 256-token context window. Reassembly (Reassemble)
@@ -318,7 +524,7 @@ type MemoryMeta struct {
 // source/kind alongside it. Returns a zero MemoryMeta with no error if the
 // memory doesn't exist.
 func (s *Store) ReassembleMeta(space, name string) (MemoryMeta, error) {
-	rows, err := s.DB.Query(`SELECT content, source, kind FROM memories WHERE space = $1 AND name = $2 ORDER BY chunk_index`, space, name)
+	rows, err := s.db.Query(`SELECT content, source, kind FROM memories WHERE space = $1 AND name = $2 ORDER BY chunk_index`, space, name)
 	if err != nil {
 		return MemoryMeta{}, err
 	}
@@ -422,7 +628,7 @@ func (s *Store) saveMemory(space, name, content, source, kind string, overwrite 
 		}
 	}
 
-	tx, err := s.DB.Begin()
+	tx, err := s.db.Begin()
 	if err != nil {
 		return false, 0, err
 	}
@@ -473,7 +679,7 @@ func (s *Store) saveMemory(space, name, content, source, kind string, overwrite 
 // (space, name). Callers must validate flag against ValidFlags themselves
 // (IsValidFlag). The bool reports whether the memory was found.
 func (s *Store) FlagMemory(space, name, flag, note string) (bool, error) {
-	res, err := s.DB.Exec(`
+	res, err := s.db.Exec(`
 		UPDATE memories SET flag = $1, flagged_at = now(), flag_note = $2
 		WHERE space = $3 AND name = $4
 	`, flag, note, space, name)
@@ -487,7 +693,7 @@ func (s *Store) FlagMemory(space, name, flag, note string) (bool, error) {
 // DeleteMemory deletes a memory by (space, name); the bool reports whether
 // anything was deleted.
 func (s *Store) DeleteMemory(space, name string) (bool, error) {
-	res, err := s.DB.Exec(`DELETE FROM memories WHERE space = $1 AND name = $2`, space, name)
+	res, err := s.db.Exec(`DELETE FROM memories WHERE space = $1 AND name = $2`, space, name)
 	if err != nil {
 		return false, err
 	}
@@ -509,7 +715,7 @@ func (s *Store) ListMemoryNames(space, source, kind string) ([]string, error) {
 		query += fmt.Sprintf(" AND kind = $%d", len(args))
 	}
 	query += ` ORDER BY name`
-	rows, err := s.DB.Query(query, args...)
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -551,7 +757,7 @@ func (s *Store) ListAll(source, kind string) ([]SpaceName, error) {
 		query += ` WHERE ` + strings.Join(clauses, " AND ")
 	}
 	query += ` ORDER BY space, name`
-	rows, err := s.DB.Query(query, args...)
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -569,7 +775,7 @@ func (s *Store) ListAll(source, kind string) ([]SpaceName, error) {
 
 // Spaces lists the distinct spaces that currently hold any memory.
 func (s *Store) Spaces() ([]string, error) {
-	rows, err := s.DB.Query(`SELECT DISTINCT space FROM memories ORDER BY space`)
+	rows, err := s.db.Query(`SELECT DISTINCT space FROM memories ORDER BY space`)
 	if err != nil {
 		return nil, err
 	}
@@ -629,7 +835,7 @@ func (s *Store) SearchMemories(space, query string, limit int, w SearchWeights, 
 	}
 	sqlQuery += fmt.Sprintf(` ORDER BY distance ASC LIMIT $%d`, len(args)+1)
 	args = append(args, limit*5)
-	rows, err := s.DB.Query(sqlQuery, args...)
+	rows, err := s.db.Query(sqlQuery, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -693,7 +899,7 @@ type MemoryCentroid struct {
 // embedding (the average of its chunk embeddings), source, kind, flag, and
 // most recent update time.
 func (s *Store) MemoryCentroids(space string) ([]MemoryCentroid, error) {
-	rows, err := s.DB.Query(`
+	rows, err := s.db.Query(`
 		SELECT name, max(source), max(kind), max(coalesce(flag, '')), avg(embedding)::text, max(updated_at)
 		FROM memories WHERE space = $1 GROUP BY name
 	`, space)
@@ -732,7 +938,7 @@ type RecentMemory struct {
 // since they represent state (what's in progress, what was decided) rather
 // than static facts.
 func (s *Store) RecentMemories(space string, limit int) ([]RecentMemory, error) {
-	rows, err := s.DB.Query(`
+	rows, err := s.db.Query(`
 		SELECT name, max(kind) AS kind, max(updated_at) AS updated_at
 		FROM memories
 		WHERE space = $1
@@ -762,7 +968,7 @@ func (s *Store) RecentMemories(space string, limit int) ([]RecentMemory, error) 
 		return out, nil
 	}
 
-	contentRows, err := s.DB.Query(`
+	contentRows, err := s.db.Query(`
 		SELECT name, content FROM memories
 		WHERE space = $1 AND name = ANY($2)
 		ORDER BY name, chunk_index
@@ -819,7 +1025,7 @@ func (s *Store) Export(space, source string) ([]MemoryExport, error) {
 		query += ` WHERE ` + strings.Join(clauses, " AND ")
 	}
 	query += ` ORDER BY space, name, chunk_index`
-	rows, err := s.DB.Query(query, args...)
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}

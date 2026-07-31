@@ -9,13 +9,39 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Postgres so the tenant-isolation tests in internal/store actually run.
+    # They use a stub embedder and need no Ollama, so this stays cheap — and
+    # a security boundary whose test silently skips is not a tested boundary.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: memory_vault
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
+      # The app role is deliberately unprivileged: superusers bypass RLS, so
+      # testing as one would prove nothing about tenant isolation.
+      - name: Provision extension and unprivileged app role
+        env:
+          PGPASSWORD: postgres
+        run: psql -h localhost -U postgres -d memory_vault -v ON_ERROR_STOP=1 -f deploy/init-db.sql
       - run: go vet ./...
       - run: go test ./... -v
+        env:
+          DATABASE_URL: postgres://memory_vault_app:memory_vault_app@localhost:5432/memory_vault?sslmode=disable
+          SUPERUSER_DATABASE_URL: postgres://postgres:postgres@localhost:5432/memory_vault?sslmode=disable
       - run: go build -o /dev/null .
 
   build-and-push:

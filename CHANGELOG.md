@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+**Step 1 of multi-tenancy — tenants and row-level security.** Isolation is
+now enforced by Postgres rather than by application code filtering
+correctly. Search, summarization, and provenance logic is untouched; it
+simply operates inside a tenant-scoped connection.
+
+- New `tenants` table (`id`, `email`, `plan`, `created_at`,
+  `stripe_customer_id`) and a `tenant_id` on `memories`, defaulted from the
+  session variable so no `INSERT` had to change.
+- RLS policy `memories_tenant_isolation` filters every statement on
+  `current_setting('app.tenant_id')`, with `FORCE ROW LEVEL SECURITY` so
+  the table owner is bound by it too. Primary key widened to
+  `(tenant_id, space, name, chunk_index)`.
+- The storage layer reaches Postgres only through an unexported
+  tenant-bound wrapper that opens a transaction and binds `app.tenant_id`
+  before any query. `Store` no longer exposes a `*sql.DB`, so no caller can
+  reach the pool and skip the binding. `Store.Ping` replaces `st.DB.Exec`
+  for `/healthz`.
+- **Breaking:** the server now refuses to start when `DATABASE_URL` names a
+  superuser or a `BYPASSRLS` role, because RLS cannot be enforced for such
+  a role and tenant isolation would be silently absent. `POSTGRES_USER` in
+  the standard Postgres image is a superuser, so existing deployments must
+  switch to the unprivileged role created by the new `deploy/init-db.sql`.
+  `docker-compose.yml` now applies that automatically and connects as
+  `memory_vault_app`.
+- Rows written before multi-tenancy are adopted by a bootstrap tenant
+  during migration, so an existing single-tenant vault keeps working
+  unchanged. The migration runs in a single transaction.
+- CI now runs a Postgres service, so the tenant-isolation tests actually
+  execute on every PR instead of skipping.
+
 ## 0.9.0
 
 Health-check-based DNS failover to a standby instance, plus a fix to a
