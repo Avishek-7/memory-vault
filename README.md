@@ -208,13 +208,14 @@ memory-vault import --file backup.json
 # or: cat backup.json | memory-vault import
 ```
 
-Both operate on **one tenant at a time**, because they go through the same
-RLS-scoped storage layer as everything else. They default to the bootstrap
-tenant, and that default holds only while it is the only tenant — once
-`tenant create` has been used, `-tenant <id>` is required and an unscoped
-`export` exits with an error rather than quietly backing up a fraction of the
-vault. There is no all-tenants export yet, so `deploy/backup.sh` currently
-backs up a single tenant; see [Fallback / failover](#fallback--failover).
+**This is a portability tool, not a backup tool.** Both operate on one tenant
+at a time, because they go through the same RLS-scoped storage layer as
+everything else — they default to the bootstrap tenant, and once `tenant
+create` has been used, `-tenant <id>` is required rather than assumed. Their
+value is that content is re-chunked and re-embedded on import, so an export
+survives a change of embedding model or dimension. For disaster recovery use
+`deploy/backup.sh`, which dumps every tenant; see
+[Backups cover every tenant](#backups-cover-every-tenant).
 
 `export`/`import` need the same `DATABASE_URL` (and `OLLAMA_URL` or
 `EMBED_PROVIDER=openai` config, for `import`'s re-embedding) as the
@@ -480,21 +481,15 @@ Claude Code, Copilot, n8n, or anything else pointed at the same MCP URL)
 can be made to fail over to a standby instance automatically, without
 touching every client's config. The pieces, in order:
 
-1. **Backup** (`deploy/backup.sh`, on the primary): periodically exports
-   every space via the existing `export_memories`/CLI path, encrypts it
-   with [age](https://github.com/FiloSottile/age), and pushes it to a
-   private git repo used only for backups.
-
-   > **Single-tenant only, for now.** `export` covers one tenant, so this
-   > backs up the bootstrap tenant. On a vault where `tenant create` has
-   > been used it exits with an error rather than silently omitting the
-   > other tenants — but that means multi-tenant deployments have no
-   > working backup path yet. Fixing it properly needs an all-tenants
-   > export format, which hasn't been designed.
+1. **Backup** (`deploy/backup.sh`, on the primary): periodically dumps the
+   whole database with `pg_dump`, encrypts it with
+   [age](https://github.com/FiloSottile/age), and pushes it to a private
+   git repo used only for backups.
 2. **Standby sync** (`deploy/standby-sync.sh`, on the standby): a second,
-   always-on memory-vault instance periodically pulls the latest backup
-   and imports it with `overwrite: true`, so it's never far behind the
-   primary.
+   always-on memory-vault instance periodically pulls the latest backup and
+   restores it with `psql`, so it's never far behind the primary. The
+   restore is a *mirror*, not a merge: the dump is taken with `--clean
+   --if-exists` and replaces whatever the standby held.
 3. **Health-check-based DNS failover** (`deploy/failover-watch.sh`, on the
    standby): polls the primary's `GET /healthz` (a cheap Postgres ping —
    see below). After several consecutive failures it flips the Cloudflare
@@ -517,6 +512,35 @@ the one taking live writes), run `backup.sh` against it, and import that
 into the other side — not something this tooling does for you. This is a
 fallback for read/write continuity during an outage, not a true
 multi-primary setup.
+
+### Backups cover every tenant
+
+`backup.sh` uses `pg_dump` rather than `memory-vault export`, because export
+goes through the RLS-scoped storage layer and therefore covers exactly **one**
+tenant. On a multi-tenant vault that would silently back up a fraction of the
+data. The dump also preserves what a JSON export deliberately drops:
+embeddings, API keys, tenant rows, table ownership, and the RLS policy itself.
+
+`BACKUP_DATABASE_URL` must name a **superuser or `BYPASSRLS`** role, and
+*cannot* be the app's own `DATABASE_URL`. `memories` has `FORCE ROW LEVEL
+SECURITY`, which binds the table owner too, so `pg_dump` connecting as the app
+role fails outright with *"query would be affected by row-level security
+policy"*. Either use the database superuser, or create a least-privilege
+reader:
+
+```sql
+CREATE ROLE memory_vault_backup LOGIN BYPASSRLS PASSWORD '...';
+GRANT USAGE ON SCHEMA public TO memory_vault_backup;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO memory_vault_backup;
+```
+
+`backup.sh` checks this up front and refuses to run otherwise, rather than
+producing a backup that is quietly empty.
+
+The standby must already have the `memory_vault_app` role (`deploy/init-db.sql`)
+before its first restore: the dump reassigns table ownership to that role by
+name, and without it the tables stay owned by the restoring superuser — after
+which the app fails its own migration on *"must be owner of table memories"*.
 
 ### `GET /healthz`
 
@@ -576,8 +600,9 @@ server binary itself:
 | `BACKUP_GIT_REMOTE` | *(required)* | Private git repo backups are pushed to / pulled from (never this repo) |
 | `BACKUP_GIT_DIR` | `/var/lib/memory-vault-backup/repo` (backup.sh) / `/var/lib/memory-vault-backup/standby-repo` (standby-sync.sh) | Local clone of `BACKUP_GIT_REMOTE` |
 | `BACKUP_GIT_BRANCH` | `main` | Branch backups are committed to / pulled from |
-| `BACKUP_FILE_NAME` | `memory-vault-export.age` | Encrypted export's file name inside the backup repo |
-| `MEMORY_VAULT_BIN` | `memory-vault` | Path to the `memory-vault` binary, for `backup.sh`/`standby-sync.sh`'s export/import calls |
+| `BACKUP_FILE_NAME` | `memory-vault-dump.sql.age` | Encrypted dump's file name inside the backup repo |
+| `BACKUP_DATABASE_URL` | *(required by `backup.sh`)* | Postgres URL for `pg_dump`. Must be a **superuser or `BYPASSRLS`** role — see [Backups cover every tenant](#backups-cover-every-tenant) |
+| `RESTORE_DATABASE_URL` | *(required by `standby-sync.sh`)* | The standby's own Postgres, as a **superuser**: the restore recreates the schema, reassigns ownership, and reinstalls the RLS policy |
 | `STANDBY_SYNC_LOG` | `/var/log/memory-vault-standby-sync.log` | `standby-sync.sh`'s outcome log (synced/skipped/failed, with counts) |
 | `STANDBY_STATE_DIR` | `/var/lib/memory-vault-backup/standby-state` | Where `standby-sync.sh` tracks the last-synced backup commit |
 | `HEALTH_URL` | *(required)* | The primary's `/healthz` URL, polled by `failover-watch.sh` |
