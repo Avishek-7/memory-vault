@@ -2,11 +2,20 @@
 # memory-vault standby sync
 #
 # Pulls the latest encrypted backup pushed by deploy/backup.sh (same
-# BACKUP_GIT_REMOTE/BACKUP_GIT_BRANCH), decrypts it with age, and imports it
-# with --overwrite into this host's own local memory-vault instance, so the
-# standby is never far behind the primary. Meant to run on the standby
-# host only, on a short interval (default every 15 minutes via
-# memory-vault-standby-sync.timer).
+# BACKUP_GIT_REMOTE/BACKUP_GIT_BRANCH), decrypts it with age, and restores the
+# pg_dump into this host's own local Postgres, so the standby is never far
+# behind the primary. Meant to run on the standby host only, on a short
+# interval (default every 15 minutes via memory-vault-standby-sync.timer).
+#
+# The dump is --clean --if-exists, so a restore replaces whatever the standby
+# already had: this is a mirror of the primary, not a merge. It carries every
+# tenant, their API keys, and the RLS policy, none of which the older
+# JSON-import path covered.
+#
+# The memory_vault_app role must already exist on the standby (deploy/init-db.sql),
+# because the dump reassigns table ownership to it by name. Restoring without
+# it leaves the tables owned by the restoring superuser, and the app would
+# then fail its own migration on "must be owner of table memories".
 #
 # Every run appends one line to STANDBY_SYNC_LOG recording what happened
 # (synced / skipped-no-change / failed, with counts), so a person debugging
@@ -15,33 +24,31 @@
 #
 # Required env (e.g. via /etc/memory-vault-standby-sync.env, loaded by the
 # systemd unit):
-#   DATABASE_URL       - the standby's own local Postgres, not the primary's
+#   RESTORE_DATABASE_URL - the standby's own local Postgres, not the primary's,
+#                        as a SUPERUSER: the restore recreates the schema,
+#                        reassigns ownership, and reinstalls the RLS policy,
+#                        none of which the unprivileged app role may do
 #   BACKUP_GIT_REMOTE  - same private backup repo deploy/backup.sh pushes to
 #   AGE_IDENTITY        - path to the age private key file that can decrypt
 #                        backups (the secret half of backup.sh's AGE_RECIPIENT)
 # Optional env:
-#   OLLAMA_URL           - needed for import's re-embed step, same as the
-#                          standby memory-vault instance's own config
-#   MEMORY_VAULT_BIN     - path to the memory-vault binary (default: memory-vault, must be on PATH)
 #   BACKUP_GIT_DIR       - local mirror clone (default: /var/lib/memory-vault-backup/standby-repo;
 #                          deliberately separate from backup.sh's BACKUP_GIT_DIR
 #                          in case both scripts ever run on the same host)
 #   BACKUP_GIT_BRANCH    - branch to pull from (default: main)
-#   BACKUP_FILE_NAME     - encrypted file name inside the repo (default: memory-vault-export.age)
+#   BACKUP_FILE_NAME     - encrypted file name inside the repo (default: memory-vault-dump.sql.age)
 #   STANDBY_SYNC_LOG     - log file (default: /var/log/memory-vault-standby-sync.log)
 #   STANDBY_STATE_DIR    - where the last-synced-commit marker lives
 #                          (default: /var/lib/memory-vault-backup/standby-state)
 
 set -eu
 
-: "${DATABASE_URL:?DATABASE_URL is required}"
+: "${RESTORE_DATABASE_URL:?RESTORE_DATABASE_URL is required (the standby Postgres, as a superuser)}"
 : "${BACKUP_GIT_REMOTE:?BACKUP_GIT_REMOTE is required}"
 : "${AGE_IDENTITY:?AGE_IDENTITY is required (path to the age private key file)}"
-
-MEMORY_VAULT_BIN="${MEMORY_VAULT_BIN:-memory-vault}"
 BACKUP_GIT_DIR="${BACKUP_GIT_DIR:-/var/lib/memory-vault-backup/standby-repo}"
 BACKUP_GIT_BRANCH="${BACKUP_GIT_BRANCH:-main}"
-BACKUP_FILE_NAME="${BACKUP_FILE_NAME:-memory-vault-export.age}"
+BACKUP_FILE_NAME="${BACKUP_FILE_NAME:-memory-vault-dump.sql.age}"
 STANDBY_SYNC_LOG="${STANDBY_SYNC_LOG:-/var/log/memory-vault-standby-sync.log}"
 STANDBY_STATE_DIR="${STANDBY_STATE_DIR:-/var/lib/memory-vault-backup/standby-state}"
 
@@ -54,6 +61,11 @@ log() {
 if ! command -v age >/dev/null 2>&1; then
 	log "FAIL age not found on PATH"
 	echo "standby-sync.sh: 'age' not found on PATH" >&2
+	exit 1
+fi
+if ! command -v psql >/dev/null 2>&1; then
+	log "FAIL psql not found on PATH"
+	echo "standby-sync.sh: 'psql' not found on PATH (install the postgresql client tools)" >&2
 	exit 1
 fi
 if [ ! -r "$AGE_IDENTITY" ]; then
@@ -96,7 +108,7 @@ fi
 
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT
-plain_file="$work_dir/export.json"
+plain_file="$work_dir/dump.sql"
 
 if ! age -d -i "$AGE_IDENTITY" -o "$plain_file" "$enc_file" 2>"$work_dir/age.err"; then
 	log "FAIL commit=$current_commit decrypt error"
@@ -104,16 +116,18 @@ if ! age -d -i "$AGE_IDENTITY" -o "$plain_file" "$enc_file" 2>"$work_dir/age.err
 	exit 1
 fi
 
-if import_out="$("$MEMORY_VAULT_BIN" import --file "$plain_file" --overwrite 2>"$work_dir/import.err")"; then
-	:
-else
-	log "FAIL commit=$current_commit import error"
-	echo "standby-sync.sh: import failed: $(cat "$work_dir/import.err")" >&2
+# ON_ERROR_STOP so a partially-applied dump is a loud failure rather than a
+# standby that looks synced while holding half the primary's data.
+if ! psql "$RESTORE_DATABASE_URL" -v ON_ERROR_STOP=1 --quiet -f "$plain_file" >"$work_dir/restore.out" 2>"$work_dir/restore.err"; then
+	log "FAIL commit=$current_commit restore error"
+	echo "standby-sync.sh: restore failed: $(tail -n 5 "$work_dir/restore.err")" >&2
 	exit 1
 fi
 
-# import prints "imported %d, skipped %d" as its first line.
-counts="$(printf '%s\n' "$import_out" | head -n1)"
+counts="$(psql "$RESTORE_DATABASE_URL" -tAc \
+	"SELECT 'memories='||(SELECT count(*) FROM memories)||\
+	        ' tenants='||(SELECT count(*) FROM tenants)||\
+	        ' api_keys='||(SELECT count(*) FROM api_keys)" 2>/dev/null || echo "counts unavailable")"
 echo "$current_commit" >"$last_commit_file"
 log "OK commit=$current_commit $counts"
 echo "standby-sync.sh: synced commit $current_commit ($counts)"

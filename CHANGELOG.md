@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+**Multi-tenant backups, and a vector-search recall fix.** Both close gaps
+opened by the move to row-level security.
+
+- `deploy/backup.sh` now uses `pg_dump`, and `deploy/standby-sync.sh`
+  restores it with `psql`. The old chain ran `memory-vault export`, which
+  goes through the RLS-scoped storage layer and so covered exactly one
+  tenant — a multi-tenant vault was silently backing up a fraction of its
+  data. The dump also carries what a JSON export drops: embeddings, API
+  keys, tenant rows, table ownership, and the RLS policy.
+- **Breaking (failover tooling only):** `backup.sh` now needs
+  `BACKUP_DATABASE_URL` and `standby-sync.sh` needs `RESTORE_DATABASE_URL`,
+  both privileged. `FORCE ROW LEVEL SECURITY` binds the table owner, so
+  `pg_dump` as the app role fails outright; `backup.sh` checks for
+  superuser/`BYPASSRLS` up front rather than producing an empty backup.
+  `MEMORY_VAULT_BIN` and `OLLAMA_URL` are no longer used by either script,
+  and the backup file is now `memory-vault-dump.sql.age`.
+- Backup change-detection no longer commits on every run. Recent `pg_dump`
+  wraps output in `\restrict`/`\unrestrict` lines carrying a random token,
+  so no two dumps were byte-identical and the "nothing changed" skip never
+  fired. Those lines are excluded from the hash only.
+- The JSON `export_memories`/`import_memories` path is now documented as a
+  portability tool — it survives a change of embedding model, which a dump
+  does not — rather than as a backup.
+- Vector searches now enable pgvector's iterative index scans per
+  transaction. Note the subtlety this exposed: pgvector's settings do not
+  exist until its library is loaded into the backend, so setting
+  `hnsw.iterative_scan` on a fresh pooled connection silently succeeds as a
+  placeholder GUC and does nothing. The bind statement now forces the
+  library to load first, and a test asserts the setting is real
+  (`vartype='enum'`) on a cold connection.
+
 **Step 2 of multi-tenancy — API keys.** A request's bearer token now decides
 which tenant's memories it reaches. Step 1 built the boundary; this is what
 puts requests on the correct side of it.

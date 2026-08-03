@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"strconv"
@@ -160,12 +161,12 @@ func migrationSQL(dim int) string {
 			USING      (tenant_id = current_setting('app.tenant_id')::uuid)
 			WITH CHECK (tenant_id = current_setting('app.tenant_id')::uuid);
 
-		-- ponytail: one shared HNSW index across all tenants. A vector scan
-		-- finds the global top-k and RLS filters it afterwards, so a tenant
-		-- sharing the index with noisier neighbours can get back fewer
-		-- than the requested limit. Fix is pgvector 0.8 iterative scans
-		-- (hnsw.iterative_scan) or per-tenant partitioning, once there is
-		-- enough multi-tenant data to measure the recall loss.
+		-- One shared HNSW index across all tenants. A plain vector scan finds
+		-- the global top-k and RLS filters it afterwards, so a tenant sharing
+		-- the index with noisier neighbours could get back fewer than the
+		-- requested limit. That is handled by enabling pgvector 0.8 iterative
+		-- scans per transaction (see bindStatement), not by partitioning the
+		-- index per tenant.
 		CREATE INDEX IF NOT EXISTS memories_embedding_idx
 			ON memories USING hnsw (embedding vector_cosine_ops);
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS content_tsv tsvector
@@ -201,6 +202,88 @@ type Config struct {
 type tenantDB struct {
 	pool   *sql.DB
 	tenant string
+	// bindSQL is the statement begin() runs to scope the transaction. It is
+	// built once at Open rather than per transaction because whether it can
+	// also enable HNSW iterative scans depends on the server's pgvector
+	// version — see bindStatement.
+	bindSQL string
+}
+
+// bindStatement builds the per-transaction scoping statement.
+//
+// app.tenant_id is what the RLS policy filters on, so it is always bound.
+// When pgvector is new enough, the same statement also turns on iterative
+// index scans, which mitigate — but do not by themselves solve — a recall
+// problem created by sharing one HNSW index across all tenants: a plain
+// vector scan finds the *global* top-k and RLS filters it afterwards, so a
+// tenant whose neighbours crowd the index can get back fewer matches than it
+// asked for. Iterative scan makes pgvector keep pulling candidates instead of
+// stopping at ef_search.
+//
+// What actually keeps recall correct today is the primary key. Step 1 widened
+// it to (tenant_id, space, name, chunk_index), and the RLS predicate is an
+// indexable condition on its leading column — so the planner's natural choice
+// for a search is an exact index scan over just that tenant's rows, not an
+// approximate global one. Measured: with the vector index forced instead, a
+// 5-row tenant sharing a 5000-row index got back ZERO of its own matches, and
+// iterative scan did not rescue it (the graph traversal gave up after ~4800
+// rows without reaching them). A hard guarantee under the vector index would
+// need per-tenant partitioning; this setting is a safety net for when the
+// planner does choose that path, not a proof it is safe.
+//
+// relaxed_order rather than strict_order: SearchMemories re-ranks everything
+// in Go anyway (blending keyword and recency into the score), so paying for
+// exact index-order results would buy nothing. Measurement showed no
+// difference between the two here in any case.
+//
+// Both settings are is_local=true, so they die with the transaction and a
+// pooled connection can't carry either into the next tenant's query.
+// The MATERIALIZED CTE is load-bearing, not decoration. pgvector's GUCs only
+// exist once its shared library has been loaded into the backend, and a
+// connection fresh from the pool has not touched vector code yet. Setting
+// hnsw.iterative_scan on such a connection SILENTLY SUCCEEDS as a custom
+// placeholder GUC and does nothing at all — no error, and current_setting
+// even reads the value back. Forcing a trivial vector expression to be
+// evaluated first (which MATERIALIZED guarantees) loads the library, so the
+// set_config that follows hits the real setting. Verified by checking that
+// pg_settings reports vartype='enum', and that a bogus value is rejected.
+func bindStatement(iterativeScan bool) string {
+	if !iterativeScan {
+		return `SELECT set_config('app.tenant_id', $1, true)`
+	}
+	return `WITH warm AS MATERIALIZED (SELECT '[1]'::vector)
+	        SELECT set_config('app.tenant_id', $1, true),
+	               set_config('hnsw.iterative_scan', 'relaxed_order', true)
+	        FROM warm`
+}
+
+// supportsIterativeScan reports whether the installed pgvector can do
+// iterative index scans, added in 0.8.0. Setting the GUC on an older version
+// is a hard error ("unrecognized configuration parameter"), which would break
+// every query, so this is checked once at startup instead.
+func supportsIterativeScan(db *sql.DB) (bool, error) {
+	var version string
+	err := db.QueryRow(`SELECT extversion FROM pg_extension WHERE extname = 'vector'`).Scan(&version)
+	if err == sql.ErrNoRows {
+		return false, fmt.Errorf("the pgvector extension is not installed (see deploy/init-db.sql)")
+	}
+	if err != nil {
+		return false, err
+	}
+	var major, minor int
+	if _, err := fmt.Sscanf(version, "%d.%d", &major, &minor); err != nil {
+		// An unparseable version is not worth failing startup over; fall back
+		// to the conservative behaviour that works on every version.
+		log.Printf("could not parse pgvector version %q, leaving HNSW iterative scan off", version)
+		return false, nil
+	}
+	if major > 0 || minor >= 8 {
+		return true, nil
+	}
+	log.Printf("pgvector %s is older than 0.8, so HNSW iterative scan is unavailable: a tenant's "+
+		"search may return fewer than the requested number of matches, because the shared vector "+
+		"index is filtered by row-level security after the fact. Upgrade pgvector to fix this.", version)
+	return false, nil
 }
 
 // begin starts a transaction with app.tenant_id bound to it.
@@ -216,7 +299,7 @@ func (t *tenantDB) begin() (*sql.Tx, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(`SELECT set_config('app.tenant_id', $1, true)`, t.tenant); err != nil {
+	if _, err := tx.Exec(t.bindSQL, t.tenant); err != nil {
 		tx.Rollback()
 		return nil, fmt.Errorf("binding app.tenant_id: %w", err)
 	}
@@ -284,7 +367,7 @@ type Store struct {
 // the tenant id comes from a key lookup rather than from Open's default.
 func (s *Store) ForTenant(tenantID string) *Store {
 	scoped := *s
-	scoped.db = &tenantDB{pool: s.db.pool, tenant: tenantID}
+	scoped.db = &tenantDB{pool: s.db.pool, tenant: tenantID, bindSQL: s.db.bindSQL}
 	return &scoped
 }
 
@@ -325,11 +408,15 @@ func Open(cfg Config) (*Store, error) {
 	if err := checkEmbedDim(db, dim); err != nil {
 		return nil, err
 	}
+	iterativeScan, err := supportsIterativeScan(db)
+	if err != nil {
+		return nil, err
+	}
 	// Default to the bootstrap tenant, which owns every row written before
 	// multi-tenancy — so a single-tenant deploy behaves exactly as it did.
 	// Per-request scoping comes from ForTenant.
 	return &Store{
-		db:       &tenantDB{pool: db, tenant: BootstrapTenantID},
+		db:       &tenantDB{pool: db, tenant: BootstrapTenantID, bindSQL: bindStatement(iterativeScan)},
 		Embedder: embedder,
 		EmbedDim: dim,
 	}, nil
