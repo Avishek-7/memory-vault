@@ -208,6 +208,14 @@ memory-vault import --file backup.json
 # or: cat backup.json | memory-vault import
 ```
 
+Both operate on **one tenant at a time**, because they go through the same
+RLS-scoped storage layer as everything else. They default to the bootstrap
+tenant, and that default holds only while it is the only tenant — once
+`tenant create` has been used, `-tenant <id>` is required and an unscoped
+`export` exits with an error rather than quietly backing up a fraction of the
+vault. There is no all-tenants export yet, so `deploy/backup.sh` currently
+backs up a single tenant; see [Fallback / failover](#fallback--failover).
+
 `export`/`import` need the same `DATABASE_URL` (and `OLLAMA_URL` or
 `EMBED_PROVIDER=openai` config, for `import`'s re-embedding) as the
 server itself. `import --space other-space --source other-source
@@ -316,11 +324,17 @@ Revocation takes effect on the next request; no restart.
 
 Under Docker, prefix with `docker compose exec memory-vault`.
 
-**Anonymous access closes automatically.** With no `AUTH_TOKEN` set and no
-API keys minted, `/mcp` still serves the bootstrap tenant unauthenticated, so
-a fresh local vault needs no configuration. Setting `AUTH_TOKEN`, or minting
-the first API key, turns that off immediately — a vault with real tenants on
-it never serves them to an anonymous caller, even if you forget `AUTH_TOKEN`.
+**Anonymous access closes automatically, and stays closed.** With no
+`AUTH_TOKEN` set and no API key ever minted, `/mcp` serves the bootstrap
+tenant unauthenticated, so a fresh local vault needs no configuration. In that
+open state a request carrying an unrecognized token is also accepted — on a
+vault that serves anyone, rejecting a caller *because* they presented a stale
+credential would be stricter than rejecting nothing at all.
+
+Setting `AUTH_TOKEN`, or minting the first API key, turns that off
+immediately. Issuing a key is a **one-way door**: revoking it later does not
+re-open the vault, so responding to a leaked key by revoking it can't
+accidentally leave `/mcp` open to everyone.
 
 ## Configuration
 
@@ -464,6 +478,13 @@ touching every client's config. The pieces, in order:
    every space via the existing `export_memories`/CLI path, encrypts it
    with [age](https://github.com/FiloSottile/age), and pushes it to a
    private git repo used only for backups.
+
+   > **Single-tenant only, for now.** `export` covers one tenant, so this
+   > backs up the bootstrap tenant. On a vault where `tenant create` has
+   > been used it exits with an error rather than silently omitting the
+   > other tenants — but that means multi-tenant deployments have no
+   > working backup path yet. Fixing it properly needs an all-tenants
+   > export format, which hasn't been designed.
 2. **Standby sync** (`deploy/standby-sync.sh`, on the standby): a second,
    always-on memory-vault instance periodically pulls the latest backup
    and imports it with `overwrite: true`, so it's never far behind the

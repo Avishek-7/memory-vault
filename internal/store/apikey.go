@@ -42,6 +42,14 @@ func HashAPIKey(key string) string {
 // api_keys *before* it knows which tenant the request belongs to, so there is
 // no app.tenant_id to filter on yet. Every other table is reachable only via
 // tenantDB, and memories stays fully policy-enforced.
+//
+// A consequence worth stating plainly: the administrative calls below
+// (CreateTenant, Tenants, CreateAPIKey, APIKeys, RevokeAPIKey) are NOT scoped
+// by the receiver's tenant binding — s.ForTenant(x).RevokeAPIKey(y) will
+// happily revoke tenant y's key. That is safe today only because every caller
+// is the operator CLI, which is already fully privileged. Anything that ever
+// exposes these over HTTP must scope them itself; neither the compiler nor
+// RLS will catch it.
 
 // TenantForKey resolves a plaintext API key to the tenant that owns it.
 // Returns "" with no error when the key is unknown or revoked — an unknown
@@ -61,14 +69,20 @@ func (s *Store) TenantForKey(key string) (string, error) {
 	return tenantID, nil
 }
 
-// HasAPIKeys reports whether any live API key exists. It is what closes
-// anonymous access: a vault with no keys is a single-tenant one, where
-// unauthenticated access to the bootstrap tenant is the pre-multi-tenancy
-// behavior; the first minted key means real tenants exist, and serving them
-// to an anonymous caller would be a leak.
-func (s *Store) HasAPIKeys() (bool, error) {
+// HasMintedAPIKey reports whether an API key has ever been issued, revoked
+// ones included. It is what closes anonymous access: a vault that has never
+// had a key is a single-tenant one, where unauthenticated access to the
+// bootstrap tenant is the pre-multi-tenancy behavior; the first minted key
+// means real tenants exist, and serving them to an anonymous caller is a leak.
+//
+// Deliberately not "any *live* key": counting only unrevoked keys would mean
+// revoking the last outstanding key silently re-opens the vault to
+// unauthenticated callers — the exact opposite of what an operator revoking a
+// leaked key is trying to achieve. Issuing a key is a one-way door out of
+// single-tenant mode.
+func (s *Store) HasMintedAPIKey() (bool, error) {
 	var exists bool
-	err := s.db.pool.QueryRow(`SELECT EXISTS (SELECT 1 FROM api_keys WHERE revoked_at IS NULL)`).Scan(&exists)
+	err := s.db.pool.QueryRow(`SELECT EXISTS (SELECT 1 FROM api_keys)`).Scan(&exists)
 	return exists, err
 }
 

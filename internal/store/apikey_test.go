@@ -127,23 +127,28 @@ func TestUnknownAndRevokedKeysAreRejected(t *testing.T) {
 	}
 }
 
-// TestHasAPIKeysGatesAnonymousAccess covers the rule that closes the open
-// door: a vault with no live keys is single-tenant and may serve anonymous
-// callers, and minting the first key must flip that off immediately (no
-// restart), while revoking the last one restores it.
-func TestHasAPIKeysGatesAnonymousAccess(t *testing.T) {
+// TestHasMintedAPIKeyGatesAnonymousAccess covers the rule that closes the
+// open door: a vault that has never issued a key is single-tenant and may
+// serve anonymous callers, and minting the first key must flip that off
+// immediately, with no restart.
+//
+// The revocation case is the one that matters most. Revoking the last
+// outstanding key must NOT re-open the vault: an operator revoking a leaked
+// key would otherwise turn a closed vault into one serving the bootstrap
+// tenant to any unauthenticated caller, at exactly the worst moment.
+func TestHasMintedAPIKeyGatesAnonymousAccess(t *testing.T) {
 	st := setupTenantDB(t)
 	clearAPIKeys(t, st)
 	makeTenant(t, st, tenantAID, "a@example.test")
 
-	if has, err := st.HasAPIKeys(); err != nil || has {
-		t.Fatalf("HasAPIKeys on an empty vault = (%v, %v), want (false, nil)", has, err)
+	if has, err := st.HasMintedAPIKey(); err != nil || has {
+		t.Fatalf("HasMintedAPIKey on a vault that never issued one = (%v, %v), want (false, nil)", has, err)
 	}
 	if _, err := st.CreateAPIKey(tenantAID, "first"); err != nil {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}
-	if has, err := st.HasAPIKeys(); err != nil || !has {
-		t.Fatalf("HasAPIKeys after minting = (%v, %v), want (true, nil); anonymous access would stay open", has, err)
+	if has, err := st.HasMintedAPIKey(); err != nil || !has {
+		t.Fatalf("HasMintedAPIKey after minting = (%v, %v), want (true, nil); anonymous access would stay open", has, err)
 	}
 
 	keys, err := st.APIKeys(tenantAID)
@@ -153,8 +158,9 @@ func TestHasAPIKeysGatesAnonymousAccess(t *testing.T) {
 	if _, err := st.RevokeAPIKey(keys[0].ID); err != nil {
 		t.Fatalf("RevokeAPIKey: %v", err)
 	}
-	if has, err := st.HasAPIKeys(); err != nil || has {
-		t.Errorf("HasAPIKeys after revoking the only key = (%v, %v), want (false, nil)", has, err)
+	if has, err := st.HasMintedAPIKey(); err != nil || !has {
+		t.Errorf("HasMintedAPIKey after revoking the last key = (%v, %v), want (true, nil): "+
+			"revoking a leaked key must not re-open the vault to anonymous callers", has, err)
 	}
 }
 

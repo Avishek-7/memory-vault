@@ -18,7 +18,7 @@ Ollama. They skip automatically unless both `DATABASE_URL` and
 `OLLAMA_URL` are set:
 
 ```
-DATABASE_URL="postgres://user:pass@localhost:5432/memory_vault?sslmode=disable" \
+DATABASE_URL="postgres://user:pass@localhost:5432/memory_vault_test?sslmode=disable" \
 OLLAMA_URL="http://localhost:11434" \
 go test ./... -v
 ```

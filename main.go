@@ -856,27 +856,33 @@ func authenticate(r *http.Request) (*store.Store, bool) {
 			log.Printf("auth: resolving api key: %v", err)
 			return nil, false
 		}
-		if tenantID == "" {
-			return nil, false // unknown or revoked key
+		if tenantID != "" {
+			return st.ForTenant(tenantID), true
 		}
-		return st.ForTenant(tenantID), true
+		// Unknown or revoked key: falls through to the open-vault check
+		// below rather than rejecting outright. On a vault that serves
+		// anonymous callers anyway, refusing a request *because* it carried
+		// an unrecognized token would be stricter than refusing nothing at
+		// all — and it would break a client still sending a stale bearer
+		// header from before AUTH_TOKEN was cleared.
 	}
 
-	// No credential presented. Anonymous access to the bootstrap tenant is
-	// the pre-multi-tenancy behavior and stays available for a fresh local
-	// vault — but only while the vault actually is single-tenant. AUTH_TOKEN
-	// being set, or the first API key being minted, turns it off, so a deploy
-	// that grows real tenants without setting AUTH_TOKEN fails closed instead
-	// of handing the bootstrap tenant to anyone who can reach /mcp.
+	// Either no credential, or one that matched nothing. Anonymous access to
+	// the bootstrap tenant is the pre-multi-tenancy behavior and stays
+	// available for a fresh local vault — but only while the vault actually
+	// is single-tenant. AUTH_TOKEN being set, or any API key having been
+	// minted, turns it off, so a deploy that grows real tenants without
+	// setting AUTH_TOKEN fails closed instead of handing the bootstrap tenant
+	// to anyone who can reach /mcp.
 	if len(authTokens()) > 0 {
 		return nil, false
 	}
-	hasKeys, err := st.HasAPIKeys()
+	minted, err := st.HasMintedAPIKey()
 	if err != nil {
 		log.Printf("auth: checking for api keys: %v", err)
 		return nil, false
 	}
-	if hasKeys {
+	if minted {
 		return nil, false
 	}
 	return st, true
@@ -973,15 +979,43 @@ func mcpHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// cliStore picks which tenant the export/import CLI operates on.
+//
+// These commands go through the same RLS-scoped store as everything else, so
+// they see exactly one tenant's memories. Defaulting silently to the
+// bootstrap tenant on a vault that has others would mean deploy/backup.sh
+// quietly backing up a fraction of the data — with no error, and no visible
+// difference in the backup — and deploy/standby-sync.sh restoring that
+// fraction. So the bootstrap default holds only while it is the only tenant;
+// past that, -tenant is required rather than assumed.
+func cliStore(tenantID string) *store.Store {
+	if tenantID != "" {
+		return st.ForTenant(tenantID)
+	}
+	tenants, err := st.Tenants()
+	if err != nil {
+		log.Fatalf("listing tenants: %v", err)
+	}
+	for _, t := range tenants {
+		if t.ID != store.BootstrapTenantID {
+			log.Fatalf("this vault has %d tenants, so an unscoped export/import would cover "+
+				"only the bootstrap tenant's memories and silently omit the rest. "+
+				"Pass -tenant <id> (see `memory-vault tenant list`).", len(tenants))
+		}
+	}
+	return st
+}
+
 // runExportCLI backs `memory-vault export`, a non-MCP way to back up the
 // vault (or one space of it) without going through an MCP client.
 func runExportCLI(args []string) {
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
 	space := fs.String("space", "", "space to export (all spaces if omitted)")
 	source := fs.String("source", "", "source to export (all sources if omitted)")
+	tenant := fs.String("tenant", "", "tenant to export (defaults to the bootstrap tenant; required once other tenants exist)")
 	fs.Parse(args)
 
-	items, err := st.Export(*space, *source)
+	items, err := cliStore(*tenant).Export(*space, *source)
 	if err != nil {
 		log.Fatalf("export: %v", err)
 	}
@@ -998,6 +1032,7 @@ func runImportCLI(args []string) {
 	space := fs.String("space", "", "send every imported memory to this space, overriding what's in the data")
 	source := fs.String("source", "", "send every imported memory to this source, overriding what's in the data")
 	overwrite := fs.Bool("overwrite", false, "overwrite existing (space, name) pairs instead of skipping them")
+	tenant := fs.String("tenant", "", "tenant to import into (defaults to the bootstrap tenant; required once other tenants exist)")
 	fs.Parse(args)
 
 	var r io.Reader = os.Stdin
@@ -1013,7 +1048,7 @@ func runImportCLI(args []string) {
 	if err := json.NewDecoder(r).Decode(&items); err != nil {
 		log.Fatalf("import: invalid JSON: %v", err)
 	}
-	res, err := st.Import(items, *space, *source, *overwrite)
+	res, err := cliStore(*tenant).Import(items, *space, *source, *overwrite)
 	if err != nil {
 		log.Fatalf("import: %v", err)
 	}
