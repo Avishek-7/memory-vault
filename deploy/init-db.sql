@@ -17,7 +17,17 @@
 
 CREATE EXTENSION IF NOT EXISTS vector;
 
-CREATE ROLE memory_vault_app LOGIN PASSWORD 'memory_vault_app';
+-- Roles are cluster-wide, not per-database, so a plain CREATE ROLE fails on
+-- the second database in a cluster and on any re-run. That matters because
+-- an existing deployment applies this file by hand (README, "Database roles
+-- and tenant isolation"), where a bare error would abort the script before
+-- the GRANT below and leave the role unusable.
+DO $$
+BEGIN
+	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'memory_vault_app') THEN
+		CREATE ROLE memory_vault_app LOGIN PASSWORD 'memory_vault_app';
+	END IF;
+END $$;
 
 -- The app owns the tables it creates in migrationSQL, which is what lets it
 -- run ALTER TABLE ... FORCE ROW LEVEL SECURITY on them. Ownership is not

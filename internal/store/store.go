@@ -115,6 +115,20 @@ func migrationSQL(dim int) string {
 			VALUES ('%[2]s', 'self-hosted@localhost', 'team')
 			ON CONFLICT (id) DO NOTHING;
 
+		-- Deliberately no RLS, for the same reason as tenants: authentication
+		-- reads this table to find out which tenant a request belongs to, so
+		-- there is no app.tenant_id bound yet to filter it by. Only the hash
+		-- is stored, so a database dump yields no usable credentials.
+		CREATE TABLE IF NOT EXISTS api_keys (
+			id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+			tenant_id  uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+			key_hash   TEXT NOT NULL UNIQUE,
+			label      TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			revoked_at TIMESTAMPTZ
+		);
+		CREATE INDEX IF NOT EXISTS api_keys_tenant_idx ON api_keys (tenant_id);
+
 		ALTER TABLE memories ADD COLUMN IF NOT EXISTS tenant_id uuid;
 		UPDATE memories SET tenant_id = '%[2]s' WHERE tenant_id IS NULL;
 		ALTER TABLE memories ALTER COLUMN tenant_id SET NOT NULL;

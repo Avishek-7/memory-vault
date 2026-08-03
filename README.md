@@ -45,10 +45,11 @@ hardware you control.
 - **Single-node Postgres.** There's no built-in replication, sharding,
   or HA — if you need that, you're running your own Postgres cluster in
   front of this.
-- **No multi-tenant auth.** `AUTH_TOKEN` is a shared bearer token (or a
-  comma-separated list of them) checked with a constant-time compare —
-  there's no per-user identity, ACLs, or RBAC. Spaces namespace
-  memories, but anyone with a valid token can read/write any space.
+- **No ACLs or RBAC within a tenant.** API keys identify a *tenant*, and
+  Postgres row-level security keeps tenants from seeing each other — but
+  there's no per-user identity or permissions inside one. Spaces namespace
+  memories; any valid key for a tenant can read/write any of that tenant's
+  spaces.
 - **No entity or relationship modeling.** Memories are chunked text with
   embeddings, not a knowledge graph — there's no notion of "this fact
   superseded that one" beyond what `compact_memories` merges.
@@ -98,9 +99,9 @@ space; with one, it lists just that space's memory names.
 Every memory also carries a `source` — a free-form string naming whichever
 agent wrote it (e.g. `"claude-code"`, `"copilot"`, `"n8n"`), defaulting to
 `"unspecified"` if you don't pass one. It's **provenance and
-collision-avoidance, not an access boundary**: anyone with a valid
-`AUTH_TOKEN` can still read or write any source's memories in any space
-they can reach. What it does buy you is protection against silent
+collision-avoidance, not an access boundary**: anyone holding a valid
+credential for a tenant can still read or write any source's memories in
+any of that tenant's spaces. What it does buy you is protection against silent
 same-name clobbering — pass `expect_source` on `save_memory` and the write
 is rejected (naming the existing source) instead of silently overwriting
 a memory a different agent wrote under that name. Omit `expect_source` and
@@ -286,6 +287,41 @@ Rows written before multi-tenancy are adopted by a bootstrap tenant
 (`00000000-0000-0000-0000-000000000001`) during migration, so an existing
 single-tenant vault keeps working with no configuration change.
 
+## Tenants and API keys
+
+A request's bearer token decides which tenant's memories it can reach. There
+are two kinds of credential, and they're checked in this order:
+
+1. **`AUTH_TOKEN`** — the shared static token, which authenticates as the
+   bootstrap tenant. This is the self-hosted single-tenant path and behaves
+   exactly as it did before multi-tenancy.
+2. **An API key** (`mv_…`) — authenticates as the tenant it was minted for.
+
+Tenants and keys are managed from the CLI. There is no admin HTTP endpoint,
+so there is no admin endpoint to secure:
+
+```bash
+# Create a tenant and mint its first key (printed once — only the hash is stored)
+memory-vault tenant create -email someone@example.com -plan builder
+
+memory-vault tenant list                            # find a tenant id
+memory-vault key create -tenant <id> -label laptop  # mint another key
+memory-vault key list   -tenant <id>                # id, label, created, active/revoked
+memory-vault key revoke -id <key-id>                # withdraw one, by key id
+```
+
+Keys are stored as a SHA-256 digest, never in plaintext — a lost key is
+reissued, not recovered, and a database dump contains no usable credentials.
+Revocation takes effect on the next request; no restart.
+
+Under Docker, prefix with `docker compose exec memory-vault`.
+
+**Anonymous access closes automatically.** With no `AUTH_TOKEN` set and no
+API keys minted, `/mcp` still serves the bootstrap tenant unauthenticated, so
+a fresh local vault needs no configuration. Setting `AUTH_TOKEN`, or minting
+the first API key, turns that off immediately — a vault with real tenants on
+it never serves them to an anonymous caller, even if you forget `AUTH_TOKEN`.
+
 ## Configuration
 
 Environment variables:
@@ -303,7 +339,7 @@ Environment variables:
 | `OPENAI_EMBED_MODEL` | `text-embedding-3-small` | Model name for the OpenAI-compatible endpoint; only used when `EMBED_PROVIDER=openai` |
 | `PORT` | `8080` | HTTP listen port |
 | `MAX_REQUEST_BODY_MB` | `25` | Max `/mcp` request body size, in MB — guards against unbounded-memory requests (e.g. an oversized `import_memories` payload) |
-| `AUTH_TOKEN` | *(none)* | Bearer token(s) required on `/mcp` (comma-separated for multiple clients). If unset, auth is disabled — set this in production. |
+| `AUTH_TOKEN` | *(none)* | Shared bearer token(s) authenticating as the bootstrap tenant (comma-separated for multiple clients). If unset, `/mcp` is open only while no API key exists — see [Tenants and API keys](#tenants-and-api-keys) |
 | `ALLOWED_HOSTS` | *(none)* | Comma-separated `Host` header allowlist, guards against DNS-rebinding. If unset, the check is skipped — set this in production. |
 | `DB_MAX_OPEN_CONNS` | `10` | Max open Postgres connections |
 | `DB_MAX_IDLE_CONNS` | `5` | Max idle Postgres connections |

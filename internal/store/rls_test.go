@@ -32,8 +32,10 @@ func setupTenantDB(t *testing.T) *Store {
 	return st
 }
 
-// makeTenant inserts a tenant directly (there is no key-minting CLI until
-// step 2) and removes it, and everything it owns, on cleanup.
+// makeTenant inserts a tenant at a fixed id and removes it, and everything it
+// owns, on cleanup. It writes the row directly rather than going through
+// CreateTenant because these tests need predictable ids to assert against;
+// the CLI path is covered in apikey_test.go.
 func makeTenant(t *testing.T, st *Store, id, email string) {
 	t.Helper()
 	if _, err := st.db.pool.Exec(

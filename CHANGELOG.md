@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+**Step 2 of multi-tenancy — API keys.** A request's bearer token now decides
+which tenant's memories it reaches. Step 1 built the boundary; this is what
+puts requests on the correct side of it.
+
+- New `api_keys` table (`id`, `tenant_id`, `key_hash`, `label`,
+  `created_at`, `revoked_at`). Keys are 32 bytes of CSPRNG output, prefixed
+  `mv_`, and stored only as a SHA-256 digest — a lost key is reissued, never
+  recovered, and a database dump yields no usable credentials. Like
+  `tenants`, this table carries no RLS policy: authentication reads it
+  *before* it knows which tenant the request belongs to.
+- `/mcp` resolves the token to a tenant and runs every tool against a
+  `ForTenant`-scoped store, threaded through `handle`/`callTool` as a
+  parameter instead of the package-global store.
+- New CLI: `memory-vault tenant create|list` and
+  `memory-vault key create|list|revoke`. Deliberately CLI-only — there is no
+  admin HTTP surface, so there is none to secure. `tenant create` mints the
+  tenant's first key, since a tenant without one cannot reach the server.
+- `AUTH_TOKEN` keeps its old meaning: a shared static credential
+  authenticating as the bootstrap tenant. Existing self-hosted clients keep
+  working with no configuration change.
+- Anonymous access to `/mcp` now closes itself. It remains available while
+  `AUTH_TOKEN` is unset *and* no API key exists, so a fresh local vault
+  needs no configuration; minting the first key turns it off immediately, so
+  a deploy that grows real tenants can't serve them to an anonymous caller.
+- `deploy/init-db.sql` is now idempotent. Roles are cluster-wide, so its
+  `CREATE ROLE` failed on a second database in the same cluster and on any
+  re-run — aborting the script before the `GRANT` and leaving the role
+  unusable. This broke the hand-application path the README documents for
+  upgrading an existing deployment.
+- Server version reported over MCP is now `0.10.0`.
+
 **Step 1 of multi-tenancy — tenants and row-level security.** Isolation is
 now enforced by Postgres rather than by application code filtering
 correctly. Search, summarization, and provenance logic is untouched; it
