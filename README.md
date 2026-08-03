@@ -290,6 +290,12 @@ psql "$SUPERUSER_DATABASE_URL" -f deploy/init-db.sql
 ```
 
 then point `DATABASE_URL` at `memory_vault_app` rather than the superuser.
+The script is idempotent, so re-running it is safe. On an existing vault it
+also transfers ownership of the already-created tables to the app role —
+only an owner may `ALTER` a table, so without that the server would connect
+fine and then fail its migration on "must be owner of table memories".
+Change the role's password from the placeholder if Postgres is reachable
+beyond the container network.
 
 Rows written before multi-tenancy are adopted by a bootstrap tenant
 (`00000000-0000-0000-0000-000000000001`) during migration, so an existing

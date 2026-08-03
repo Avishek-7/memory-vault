@@ -33,3 +33,21 @@ END $$;
 -- run ALTER TABLE ... FORCE ROW LEVEL SECURITY on them. Ownership is not
 -- superuser: an owner is still bound by FORCE'd policies.
 GRANT ALL ON SCHEMA public TO memory_vault_app;
+
+-- On a FRESH database the block below does nothing: the app creates its own
+-- tables and therefore owns them. It exists for the upgrade path, where a
+-- vault that predates multi-tenancy already has a `memories` table owned by
+-- whoever POSTGRES_USER was. Only a table's owner may ALTER it, so without
+-- this the app would connect successfully and then fail its migration on
+-- "must be owner of table memories" — after the role and grants looked
+-- correctly configured.
+DO $$
+DECLARE
+	t text;
+BEGIN
+	FOREACH t IN ARRAY ARRAY['memories', 'tenants', 'api_keys'] LOOP
+		IF to_regclass('public.' || t) IS NOT NULL THEN
+			EXECUTE format('ALTER TABLE public.%I OWNER TO memory_vault_app', t);
+		END IF;
+	END LOOP;
+END $$;
