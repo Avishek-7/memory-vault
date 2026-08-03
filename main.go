@@ -303,8 +303,8 @@ func compactTargetName(names []string) string {
 // candidates: connected components under the similarity threshold (any
 // chain of near-duplicate centroids), plus lone memories past the
 // staleness window (candidates for solo re-summarization).
-func compactGroupsForSpace(space string) ([][]store.MemoryCentroid, error) {
-	all, err := st.MemoryCentroids(space)
+func compactGroupsForSpace(vault *store.Store, space string) ([][]store.MemoryCentroid, error) {
+	all, err := vault.MemoryCentroids(space)
 	if err != nil {
 		return nil, err
 	}
@@ -378,7 +378,7 @@ func compactGroupsForSpace(space string) ([][]store.MemoryCentroid, error) {
 // compactGroup either describes (dry_run) or performs the merge of one
 // compaction group: reassemble each source, ask the Ollama chat model to
 // consolidate them, save the result, and delete the sources it replaced.
-func compactGroup(space string, g []store.MemoryCentroid, dryRun bool) (string, error) {
+func compactGroup(vault *store.Store, space string, g []store.MemoryCentroid, dryRun bool) (string, error) {
 	names := make([]string, len(g))
 	for i, m := range g {
 		names[i] = m.Name
@@ -402,7 +402,7 @@ func compactGroup(space string, g []store.MemoryCentroid, dryRun bool) (string, 
 
 	var parts []string
 	for _, m := range g {
-		content, err := st.Reassemble(space, m.Name)
+		content, err := vault.Reassemble(space, m.Name)
 		if err != nil {
 			return "", err
 		}
@@ -426,14 +426,14 @@ func compactGroup(space string, g []store.MemoryCentroid, dryRun bool) (string, 
 	if len(g) == 1 {
 		mergedSource, mergedKind = g[0].Source, g[0].Kind
 	}
-	if _, err := st.SaveMemory(space, newName, merged, mergedSource, mergedKind); err != nil {
+	if _, err := vault.SaveMemory(space, newName, merged, mergedSource, mergedKind); err != nil {
 		return "", err
 	}
 	for _, m := range g {
 		if m.Name == newName {
 			continue
 		}
-		if _, err := st.DeleteMemory(space, m.Name); err != nil {
+		if _, err := vault.DeleteMemory(space, m.Name); err != nil {
 			return "", err
 		}
 	}
@@ -441,7 +441,7 @@ func compactGroup(space string, g []store.MemoryCentroid, dryRun bool) (string, 
 	return fmt.Sprintf("space %q: merged [%s] into %q", space, strings.Join(names, ", "), newName), nil
 }
 
-func callTool(name string, args map[string]interface{}) map[string]interface{} {
+func callTool(vault *store.Store, name string, args map[string]interface{}) map[string]interface{} {
 	switch name {
 	case "save_memory":
 		n, _ := args["name"].(string)
@@ -464,13 +464,13 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		var numChunks int
 		var err error
 		if expectSource, _ := args["expect_source"].(string); expectSource != "" {
-			numChunks, err = st.SaveMemoryExpectSource(space, n, content, source, kind, expectSource)
+			numChunks, err = vault.SaveMemoryExpectSource(space, n, content, source, kind, expectSource)
 			var conflict *store.SourceConflictError
 			if errors.As(err, &conflict) {
 				return errResult(fmt.Sprintf("memory %q in space %q already exists with source %q, not %q — refusing to overwrite", n, space, conflict.Existing, expectSource))
 			}
 		} else {
-			numChunks, err = st.SaveMemory(space, n, content, source, kind)
+			numChunks, err = vault.SaveMemory(space, n, content, source, kind)
 		}
 		if err != nil {
 			return internalErr("save_memory", err)
@@ -480,7 +480,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 	case "get_memory":
 		n, _ := args["name"].(string)
 		space := argSpace(args)
-		content, err := st.Reassemble(space, n)
+		content, err := vault.Reassemble(space, n)
 		if err != nil {
 			return internalErr("get_memory query", err)
 		}
@@ -493,7 +493,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		sourceFilter, _ := args["source"].(string)
 		kindFilter, _ := args["kind"].(string)
 		if s, ok := args["space"].(string); ok && s != "" {
-			names, err := st.ListMemoryNames(s, sourceFilter, kindFilter)
+			names, err := vault.ListMemoryNames(s, sourceFilter, kindFilter)
 			if err != nil {
 				return internalErr("list_memories query", err)
 			}
@@ -503,7 +503,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			return textResult(strings.Join(names, "\n"))
 		}
 
-		all, err := st.ListAll(sourceFilter, kindFilter)
+		all, err := vault.ListAll(sourceFilter, kindFilter)
 		if err != nil {
 			return internalErr("list_memories query", err)
 		}
@@ -536,7 +536,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		}
 		sourceFilter, _ := args["source"].(string)
 		kindFilter, _ := args["kind"].(string)
-		matches, err := st.SearchMemories(space, q, limit, searchWeights(), sourceFilter, kindFilter)
+		matches, err := vault.SearchMemories(space, q, limit, searchWeights(), sourceFilter, kindFilter)
 		if err != nil {
 			return internalErr("search_memories", err)
 		}
@@ -552,7 +552,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 	case "delete_memory":
 		n, _ := args["name"].(string)
 		space := argSpace(args)
-		found, err := st.DeleteMemory(space, n)
+		found, err := vault.DeleteMemory(space, n)
 		if err != nil {
 			return internalErr("delete_memory exec", err)
 		}
@@ -572,7 +572,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		if !store.IsValidFlag(flag) {
 			return errResult(fmt.Sprintf("invalid flag %q, want one of: %s", flag, validFlagsList()))
 		}
-		found, err := st.FlagMemory(space, n, flag, note)
+		found, err := vault.FlagMemory(space, n, flag, note)
 		if err != nil {
 			return internalErr("flag_memory", err)
 		}
@@ -591,7 +591,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 			spaces = []string{s}
 		} else {
 			var err error
-			spaces, err = st.Spaces()
+			spaces, err = vault.Spaces()
 			if err != nil {
 				return internalErr("compact_memories spaces", err)
 			}
@@ -599,12 +599,12 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 
 		var lines []string
 		for _, sp := range spaces {
-			groups, err := compactGroupsForSpace(sp)
+			groups, err := compactGroupsForSpace(vault, sp)
 			if err != nil {
 				return internalErr("compact_memories groups", err)
 			}
 			for _, g := range groups {
-				line, err := compactGroup(sp, g, dryRun)
+				line, err := compactGroup(vault, sp, g, dryRun)
 				if err != nil {
 					return internalErr("compact_memories merge", err)
 				}
@@ -632,7 +632,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		if limit > 50 {
 			limit = 50
 		}
-		recents, err := st.RecentMemories(space, limit)
+		recents, err := vault.RecentMemories(space, limit)
 		if err != nil {
 			return internalErr("get_session_summary query", err)
 		}
@@ -648,7 +648,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 	case "export_memories":
 		space, _ := args["space"].(string)
 		source, _ := args["source"].(string)
-		items, err := st.Export(space, source)
+		items, err := vault.Export(space, source)
 		if err != nil {
 			return internalErr("export_memories", err)
 		}
@@ -670,7 +670,7 @@ func callTool(name string, args map[string]interface{}) map[string]interface{} {
 		spaceOverride, _ := args["space"].(string)
 		sourceOverride, _ := args["source"].(string)
 		overwrite, _ := args["overwrite"].(bool)
-		res, err := st.Import(items, spaceOverride, sourceOverride, overwrite)
+		res, err := vault.Import(items, spaceOverride, sourceOverride, overwrite)
 		if err != nil {
 			return internalErr("import_memories", err)
 		}
@@ -699,8 +699,8 @@ func resourceURI(space, name string) string {
 // so the caller can pick the right JSON-RPC error code.
 var errNotFound = fmt.Errorf("not found")
 
-func listResources() (interface{}, error) {
-	all, err := st.ListAll("", "")
+func listResources(vault *store.Store) (interface{}, error) {
+	all, err := vault.ListAll("", "")
 	if err != nil {
 		log.Printf("resources/list query: %v", err)
 		return nil, fmt.Errorf("internal error")
@@ -722,12 +722,12 @@ func parseResourceURI(uri string) (space, name string, ok bool) {
 	return space, name, true
 }
 
-func readResource(uri string) (interface{}, error) {
+func readResource(vault *store.Store, uri string) (interface{}, error) {
 	space, name, ok := parseResourceURI(uri)
 	if !ok {
 		return nil, fmt.Errorf("invalid resource uri %q", uri)
 	}
-	content, err := st.Reassemble(space, name)
+	content, err := vault.Reassemble(space, name)
 	if err != nil {
 		log.Printf("resources/read query: %v", err)
 		return nil, fmt.Errorf("internal error")
@@ -742,7 +742,7 @@ func readResource(uri string) (interface{}, error) {
 
 // handle processes one JSON-RPC message and returns the reply to send,
 // or nil for notifications (which get no body, just a 202).
-func handle(req request) *response {
+func handle(vault *store.Store, req request) *response {
 	switch req.Method {
 	case "initialize":
 		return resultMsg(req.ID, map[string]interface{}{
@@ -751,7 +751,7 @@ func handle(req request) *response {
 				"tools":     map[string]interface{}{},
 				"resources": map[string]interface{}{},
 			},
-			"serverInfo": map[string]string{"name": "memory-vault", "version": "0.9.0"},
+			"serverInfo": map[string]string{"name": "memory-vault", "version": "0.10.0"},
 		})
 
 	case "notifications/initialized":
@@ -768,10 +768,10 @@ func handle(req request) *response {
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return errorMsg(req.ID, -32602, "invalid params")
 		}
-		return resultMsg(req.ID, callTool(params.Name, params.Arguments))
+		return resultMsg(req.ID, callTool(vault, params.Name, params.Arguments))
 
 	case "resources/list":
-		result, err := listResources()
+		result, err := listResources(vault)
 		if err != nil {
 			return errorMsg(req.ID, -32000, err.Error())
 		}
@@ -784,7 +784,7 @@ func handle(req request) *response {
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return errorMsg(req.ID, -32602, "invalid params")
 		}
-		result, err := readResource(params.URI)
+		result, err := readResource(vault, params.URI)
 		if err != nil {
 			if err == errNotFound {
 				return errorMsg(req.ID, -32001, fmt.Sprintf("resource %q not found", params.URI))
@@ -820,21 +820,72 @@ func authTokens() []string {
 	return strings.Split(raw, ",")
 }
 
-func checkAuth(r *http.Request) bool {
-	tokens := authTokens()
-	if len(tokens) == 0 {
-		return true // no AUTH_TOKEN configured: auth disabled
-	}
-	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if got == "" {
+// matchesAuthToken reports whether token is one of the AUTH_TOKEN values.
+// AUTH_TOKEN keeps exactly its pre-multi-tenancy meaning — a shared static
+// credential for the bootstrap tenant — so existing self-hosted clients keep
+// working untouched after the upgrade. Per-tenant credentials are API keys.
+func matchesAuthToken(token string) bool {
+	if token == "" {
 		return false
 	}
-	for _, t := range tokens {
-		if subtle.ConstantTimeCompare([]byte(got), []byte(t)) == 1 {
+	for _, t := range authTokens() {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(t)) == 1 {
 			return true
 		}
 	}
 	return false
+}
+
+// authenticate resolves a request's credentials to the tenant-scoped store
+// its tools should run against. The second return is false when the request
+// must be rejected; every path that returns false returns a nil store, so a
+// caller that ignores the bool cannot accidentally run unscoped.
+//
+// Precedence: AUTH_TOKEN first (cheapest, and the self-hosted path), then an
+// API key lookup, then the anonymous case.
+func authenticate(r *http.Request) (*store.Store, bool) {
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+
+	if matchesAuthToken(token) {
+		return st, true
+	}
+
+	if token != "" {
+		tenantID, err := st.TenantForKey(token)
+		if err != nil {
+			log.Printf("auth: resolving api key: %v", err)
+			return nil, false
+		}
+		if tenantID != "" {
+			return st.ForTenant(tenantID), true
+		}
+		// Unknown or revoked key: falls through to the open-vault check
+		// below rather than rejecting outright. On a vault that serves
+		// anonymous callers anyway, refusing a request *because* it carried
+		// an unrecognized token would be stricter than refusing nothing at
+		// all — and it would break a client still sending a stale bearer
+		// header from before AUTH_TOKEN was cleared.
+	}
+
+	// Either no credential, or one that matched nothing. Anonymous access to
+	// the bootstrap tenant is the pre-multi-tenancy behavior and stays
+	// available for a fresh local vault — but only while the vault actually
+	// is single-tenant. AUTH_TOKEN being set, or any API key having been
+	// minted, turns it off, so a deploy that grows real tenants without
+	// setting AUTH_TOKEN fails closed instead of handing the bootstrap tenant
+	// to anyone who can reach /mcp.
+	if len(authTokens()) > 0 {
+		return nil, false
+	}
+	minted, err := st.HasMintedAPIKey()
+	if err != nil {
+		log.Printf("auth: checking for api keys: %v", err)
+		return nil, false
+	}
+	if minted {
+		return nil, false
+	}
+	return st, true
 }
 
 // allowedHosts returns the Host header allowlist from ALLOWED_HOSTS
@@ -892,7 +943,8 @@ func mcpHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	if !checkAuth(r) {
+	vault, ok := authenticate(r)
+	if !ok {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="memory-vault"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -915,7 +967,7 @@ func mcpHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := handle(req)
+	resp := handle(vault, req)
 	if resp == nil {
 		w.WriteHeader(http.StatusAccepted)
 		return
@@ -927,15 +979,43 @@ func mcpHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// cliStore picks which tenant the export/import CLI operates on.
+//
+// These commands go through the same RLS-scoped store as everything else, so
+// they see exactly one tenant's memories. Defaulting silently to the
+// bootstrap tenant on a vault that has others would mean deploy/backup.sh
+// quietly backing up a fraction of the data — with no error, and no visible
+// difference in the backup — and deploy/standby-sync.sh restoring that
+// fraction. So the bootstrap default holds only while it is the only tenant;
+// past that, -tenant is required rather than assumed.
+func cliStore(tenantID string) *store.Store {
+	if tenantID != "" {
+		return st.ForTenant(tenantID)
+	}
+	tenants, err := st.Tenants()
+	if err != nil {
+		log.Fatalf("listing tenants: %v", err)
+	}
+	for _, t := range tenants {
+		if t.ID != store.BootstrapTenantID {
+			log.Fatalf("this vault has %d tenants, so an unscoped export/import would cover "+
+				"only the bootstrap tenant's memories and silently omit the rest. "+
+				"Pass -tenant <id> (see `memory-vault tenant list`).", len(tenants))
+		}
+	}
+	return st
+}
+
 // runExportCLI backs `memory-vault export`, a non-MCP way to back up the
 // vault (or one space of it) without going through an MCP client.
 func runExportCLI(args []string) {
 	fs := flag.NewFlagSet("export", flag.ExitOnError)
 	space := fs.String("space", "", "space to export (all spaces if omitted)")
 	source := fs.String("source", "", "source to export (all sources if omitted)")
+	tenant := fs.String("tenant", "", "tenant to export (defaults to the bootstrap tenant; required once other tenants exist)")
 	fs.Parse(args)
 
-	items, err := st.Export(*space, *source)
+	items, err := cliStore(*tenant).Export(*space, *source)
 	if err != nil {
 		log.Fatalf("export: %v", err)
 	}
@@ -952,6 +1032,7 @@ func runImportCLI(args []string) {
 	space := fs.String("space", "", "send every imported memory to this space, overriding what's in the data")
 	source := fs.String("source", "", "send every imported memory to this source, overriding what's in the data")
 	overwrite := fs.Bool("overwrite", false, "overwrite existing (space, name) pairs instead of skipping them")
+	tenant := fs.String("tenant", "", "tenant to import into (defaults to the bootstrap tenant; required once other tenants exist)")
 	fs.Parse(args)
 
 	var r io.Reader = os.Stdin
@@ -967,13 +1048,116 @@ func runImportCLI(args []string) {
 	if err := json.NewDecoder(r).Decode(&items); err != nil {
 		log.Fatalf("import: invalid JSON: %v", err)
 	}
-	res, err := st.Import(items, *space, *source, *overwrite)
+	res, err := cliStore(*tenant).Import(items, *space, *source, *overwrite)
 	if err != nil {
 		log.Fatalf("import: %v", err)
 	}
 	fmt.Printf("imported %d, skipped %d\n", len(res.Imported), len(res.Skipped))
 	if len(res.Skipped) > 0 {
 		fmt.Printf("skipped (already exist, overwrite=false): %s\n", strings.Join(res.Skipped, ", "))
+	}
+}
+
+// runTenantCLI backs `memory-vault tenant create|list`. Tenant and key
+// administration is deliberately CLI-only for now: there is no admin HTTP
+// surface to authenticate, so there is none to get wrong.
+func runTenantCLI(args []string) {
+	if len(args) == 0 {
+		log.Fatal("usage: memory-vault tenant create|list")
+	}
+	switch args[0] {
+	case "create":
+		fs := flag.NewFlagSet("tenant create", flag.ExitOnError)
+		email := fs.String("email", "", "tenant's email address (required, unique)")
+		plan := fs.String("plan", "free", "plan: free, builder, or team")
+		label := fs.String("label", "initial", "label for the key minted alongside the tenant")
+		fs.Parse(args[1:])
+		if *email == "" {
+			log.Fatal("tenant create: -email is required")
+		}
+		id, err := st.CreateTenant(*email, *plan)
+		if err != nil {
+			log.Fatalf("tenant create: %v", err)
+		}
+		// Mint the first key here: a tenant with no key cannot reach the
+		// server at all, so creating one without it is never what's wanted.
+		key, err := st.CreateAPIKey(id, *label)
+		if err != nil {
+			log.Fatalf("tenant create: tenant %s created but key minting failed: %v", id, err)
+		}
+		fmt.Printf("tenant   %s\nemail    %s\nplan     %s\napi key  %s\n\nStore the key now — only its hash is kept, so it cannot be shown again.\n", id, *email, *plan, key)
+
+	case "list":
+		tenants, err := st.Tenants()
+		if err != nil {
+			log.Fatalf("tenant list: %v", err)
+		}
+		for _, t := range tenants {
+			fmt.Printf("%s\t%s\t%s\t%s\n", t.ID, t.Email, t.Plan, t.CreatedAt.Format(time.RFC3339))
+		}
+
+	default:
+		log.Fatalf("unknown tenant subcommand %q (want create or list)", args[0])
+	}
+}
+
+// runKeyCLI backs `memory-vault key create|list|revoke`.
+func runKeyCLI(args []string) {
+	if len(args) == 0 {
+		log.Fatal("usage: memory-vault key create|list|revoke")
+	}
+	switch args[0] {
+	case "create":
+		fs := flag.NewFlagSet("key create", flag.ExitOnError)
+		tenant := fs.String("tenant", "", "tenant id to mint the key for (see `tenant list`)")
+		label := fs.String("label", "", "what this key is for, e.g. \"laptop\" or \"ci\"")
+		fs.Parse(args[1:])
+		if *tenant == "" {
+			log.Fatal("key create: -tenant is required")
+		}
+		key, err := st.CreateAPIKey(*tenant, *label)
+		if err != nil {
+			log.Fatalf("key create: %v", err)
+		}
+		fmt.Printf("%s\n\nStore it now — only its hash is kept, so it cannot be shown again.\n", key)
+
+	case "list":
+		fs := flag.NewFlagSet("key list", flag.ExitOnError)
+		tenant := fs.String("tenant", "", "tenant id whose keys to list")
+		fs.Parse(args[1:])
+		if *tenant == "" {
+			log.Fatal("key list: -tenant is required")
+		}
+		keys, err := st.APIKeys(*tenant)
+		if err != nil {
+			log.Fatalf("key list: %v", err)
+		}
+		for _, k := range keys {
+			status := "active"
+			if k.RevokedAt.Valid {
+				status = "revoked " + k.RevokedAt.Time.Format(time.RFC3339)
+			}
+			fmt.Printf("%s\t%s\t%s\t%s\n", k.ID, k.Label, k.CreatedAt.Format(time.RFC3339), status)
+		}
+
+	case "revoke":
+		fs := flag.NewFlagSet("key revoke", flag.ExitOnError)
+		id := fs.String("id", "", "key id to revoke (see `key list`; not the key itself)")
+		fs.Parse(args[1:])
+		if *id == "" {
+			log.Fatal("key revoke: -id is required")
+		}
+		revoked, err := st.RevokeAPIKey(*id)
+		if err != nil {
+			log.Fatalf("key revoke: %v", err)
+		}
+		if !revoked {
+			log.Fatalf("key revoke: no active key with id %s", *id)
+		}
+		fmt.Printf("revoked key %s\n", *id)
+
+	default:
+		log.Fatalf("unknown key subcommand %q (want create, list, or revoke)", args[0])
 	}
 }
 
@@ -995,6 +1179,12 @@ func main() {
 			return
 		case "import":
 			runImportCLI(os.Args[2:])
+			return
+		case "tenant":
+			runTenantCLI(os.Args[2:])
+			return
+		case "key":
+			runKeyCLI(os.Args[2:])
 			return
 		}
 	}

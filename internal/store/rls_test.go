@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -19,6 +20,7 @@ func setupTenantDB(t *testing.T) *Store {
 	if url == "" {
 		t.Skip("DATABASE_URL not set, skipping RLS isolation test")
 	}
+	requireDisposableDB(t, url)
 	st, err := Open(Config{
 		DatabaseURL:  url,
 		Embedder:     &stubEmbedder{vec: make([]float32, DefaultEmbedDim)},
@@ -32,8 +34,38 @@ func setupTenantDB(t *testing.T) *Store {
 	return st
 }
 
-// makeTenant inserts a tenant directly (there is no key-minting CLI until
-// step 2) and removes it, and everything it owns, on cleanup.
+// requireDisposableDB refuses to run against a database that doesn't look
+// like a throwaway. These tests are destructive by nature — they DROP
+// `memories` and DELETE every row of `api_keys` — and DATABASE_URL is an
+// ordinary environment variable that a shell which has sourced a deployment's
+// .env will already have pointing at production. Since API keys are stored
+// only as hashes, a wrong run there is unrecoverable: every client has to be
+// re-issued.
+//
+// This fails rather than skips. A security test that quietly does nothing is
+// the failure mode this package already went out of its way to avoid, so the
+// guard has to be noisy about being tripped.
+func requireDisposableDB(t *testing.T, dbURL string) {
+	t.Helper()
+	if os.Getenv("MEMORY_VAULT_ALLOW_DESTRUCTIVE_TESTS") == "1" {
+		return
+	}
+	parsed, err := url.Parse(dbURL)
+	if err != nil {
+		t.Fatalf("DATABASE_URL is not a valid URL: %v", err)
+	}
+	if name := strings.TrimPrefix(parsed.Path, "/"); !strings.Contains(name, "test") {
+		t.Fatalf("refusing to run destructive tests against database %q: these tests drop "+
+			"tables and delete every API key, and the name doesn't look disposable. Point "+
+			"DATABASE_URL at a database whose name contains \"test\", or set "+
+			"MEMORY_VAULT_ALLOW_DESTRUCTIVE_TESTS=1 if you are certain.", name)
+	}
+}
+
+// makeTenant inserts a tenant at a fixed id and removes it, and everything it
+// owns, on cleanup. It writes the row directly rather than going through
+// CreateTenant because these tests need predictable ids to assert against;
+// the CLI path is covered in apikey_test.go.
 func makeTenant(t *testing.T, st *Store, id, email string) {
 	t.Helper()
 	if _, err := st.db.pool.Exec(
@@ -221,6 +253,9 @@ func TestUpgradeFromSingleTenantPreservesData(t *testing.T) {
 	if url == "" {
 		t.Skip("DATABASE_URL not set, skipping upgrade test")
 	}
+	// This test drops and rebuilds `memories` outright, so it needs the same
+	// guard as setupTenantDB, which it deliberately doesn't go through.
+	requireDisposableDB(t, url)
 	raw, err := sql.Open("postgres", url)
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
