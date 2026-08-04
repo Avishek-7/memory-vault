@@ -699,6 +699,25 @@ func (s *Store) SaveMemoryExpectSource(space, name, content, source, kind, expec
 	return chunks, err
 }
 
+// memoryExists reports whether (space, name) already holds a memory for the
+// bound tenant. RLS scopes it, so it cannot see another tenant's rows and
+// wrongly report a collision.
+func (s *Store) memoryExists(space, name string) (bool, error) {
+	rows, err := s.db.Query(
+		`SELECT EXISTS (SELECT 1 FROM memories WHERE space = $1 AND name = $2)`, space, name)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var exists bool
+	if rows.Next() {
+		if err := rows.Scan(&exists); err != nil {
+			return false, err
+		}
+	}
+	return exists, rows.Err()
+}
+
 // isUniqueViolation reports whether err is a Postgres unique-constraint
 // violation (SQLSTATE 23505) — here, a concurrent write to the same
 // (space, name, chunk_index) primary key.
@@ -722,6 +741,25 @@ func isUniqueViolation(err error) bool {
 // write happens; a mismatch returns a *SourceConflictError and writes
 // nothing.
 func (s *Store) saveMemory(space, name, content, source, kind string, overwrite bool, expectSource string) (wrote bool, chunks int, err error) {
+	// A non-overwrite write to a name that already exists is going to be
+	// skipped, so find that out BEFORE embedding rather than after. Embedding
+	// is an HTTP round-trip per chunk, and discarding it is the common case
+	// rather than the rare one: import_memories defaults to overwrite=false,
+	// and a standby re-imports the same backup on every sync.
+	//
+	// Advisory only. The in-transaction check and the insert's own unique
+	// violation stay authoritative for a writer that inserts between this
+	// lookup and the write.
+	if !overwrite {
+		exists, err := s.memoryExists(space, name)
+		if err != nil {
+			return false, 0, err
+		}
+		if exists {
+			return false, 0, nil
+		}
+	}
+
 	// Embed before opening the transaction: each Embed call is an HTTP
 	// round-trip to Ollama/OpenAI, and doing this inside the tx would hold
 	// the expectSource row lock (below) for the whole embedding pipeline

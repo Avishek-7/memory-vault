@@ -42,6 +42,13 @@ Fixed in review of the above:
   is the single source of truth for that mapping.
 - `Retry-After` truncated fractional delays, so a 1.33s wait was advertised as
   1s and a compliant client retried early into another 429. It now rounds up.
+- A non-overwrite write to a name that already exists is now detected
+  before the content is embedded. `saveMemory` embeds outside its
+  transaction on purpose, so a duplicate destined to be skipped was paying
+  for the whole embedding pipeline — an HTTP round-trip per chunk — first.
+  That is the common case rather than the rare one: `import_memories`
+  defaults to `overwrite: false` and a standby re-imports the same backup
+  on every sync.
 - A non-overwrite write to a name that already exists now short-circuits
   before the quota check. It was already going to be skipped by the primary
   key, but charging the incoming payload against the cap could reject an

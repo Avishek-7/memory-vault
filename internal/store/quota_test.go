@@ -357,3 +357,82 @@ func TestImportOfALargerDuplicateIsSkippedNotRejected(t *testing.T) {
 		t.Errorf("the skipped duplicate modified the stored memory (len %d)", len(got))
 	}
 }
+
+// countingEmbedder records how many times it was asked to embed, and can be
+// made to fail — the two ways to prove embedding did not happen.
+type countingEmbedder struct {
+	calls int
+	err   error
+}
+
+func (c *countingEmbedder) Embed(string) ([]float32, error) {
+	c.calls++
+	if c.err != nil {
+		return nil, c.err
+	}
+	return make([]float32, DefaultEmbedDim), nil
+}
+
+// TestDuplicateSkipCostsNoEmbedding covers the wasted work in the skip path.
+// saveMemory embeds BEFORE opening its transaction (deliberately, so the
+// expectSource row lock is not held across HTTP round-trips), so a duplicate
+// that is going to be skipped was paying for the whole embedding pipeline
+// first. import_memories defaults to overwrite=false and a standby re-imports
+// the same backup on every sync, so discarding that work is the common case.
+func TestDuplicateSkipCostsNoEmbedding(t *testing.T) {
+	st := setupTenantDB(t)
+	makeTenant(t, st, tenantAID, "a@example.test")
+	tenant := st.ForTenant(tenantAID)
+	t.Cleanup(func() { tenant.DeleteMemory("dup-embed", "existing") })
+
+	if _, err := tenant.SaveMemory("dup-embed", "existing", "some content", DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+
+	counter := &countingEmbedder{}
+	tenant.Embedder = counter
+	res, err := tenant.Import([]MemoryExport{
+		{Name: "existing", Space: "dup-embed", Content: "some content"},
+	}, "", "", false)
+	if err != nil {
+		t.Fatalf("importing a duplicate: %v", err)
+	}
+	if len(res.Skipped) != 1 {
+		t.Fatalf("Import skipped %v, want the duplicate skipped", res.Skipped)
+	}
+	if counter.calls != 0 {
+		t.Errorf("embedding was called %d time(s) for a memory that was skipped; the duplicate "+
+			"check must run before the embedding pipeline", counter.calls)
+	}
+}
+
+// TestDuplicateSkipSurvivesABrokenEmbedder is the same property proven the
+// other way round: if the skip path still reached the embedder, a failing one
+// would surface as an error instead of a clean skip.
+func TestDuplicateSkipSurvivesABrokenEmbedder(t *testing.T) {
+	st := setupTenantDB(t)
+	makeTenant(t, st, tenantAID, "a@example.test")
+	tenant := st.ForTenant(tenantAID)
+	t.Cleanup(func() { tenant.DeleteMemory("dup-broken", "existing") })
+
+	if _, err := tenant.SaveMemory("dup-broken", "existing", "some content", DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+
+	tenant.Embedder = &countingEmbedder{err: errors.New("embedding backend is down")}
+	res, err := tenant.Import([]MemoryExport{
+		{Name: "existing", Space: "dup-broken", Content: "some content"},
+	}, "", "", false)
+	if err != nil {
+		t.Fatalf("a duplicate should be skipped without consulting the embedder, got: %v", err)
+	}
+	if len(res.Skipped) != 1 {
+		t.Errorf("Import skipped %v, want the duplicate skipped", res.Skipped)
+	}
+
+	// And a genuinely new memory must still fail loudly on a broken embedder,
+	// or this "fix" would be silently swallowing real errors.
+	if _, _, err := tenant.saveMemory("dup-broken", "brand-new", "content", DefaultSource, DefaultKind, false, ""); err == nil {
+		t.Error("a new memory was written despite the embedder failing")
+	}
+}
