@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+**Step 3 of multi-tenancy — rate limits and quotas.** Each tenant's plan now
+caps what it can consume, so one tenant cannot monopolise the server or fill
+the disk.
+
+- Per-tenant request rate limiting via an in-process token bucket
+  (`internal/ratelimit`), enforced after authentication since the bucket is
+  per tenant. Exceeding it returns HTTP `429` with `Retry-After`. Tokens
+  refill continuously rather than in fixed windows, so a tenant cannot spend
+  two windows' budget back to back. Idle buckets are swept, so the map does
+  not grow once per tenant forever.
+- Per-tenant storage quotas on memory count and total content bytes,
+  enforced inside `saveMemory`'s transaction — after any overwrite delete, so
+  replacing a memory at the cap still works rather than being counted twice.
+  Quotas count the whole tenant across every space: a space is a namespace,
+  not a billing boundary.
+- Limits are hardcoded per plan with `PLAN_<PLAN>_RPM` / `_BURST` /
+  `_MAX_MEMORIES` / `_MAX_MB` overrides. An unrecognised plan falls back to
+  `free`'s limits, not to unlimited, so a typo cannot hand out free storage.
+- **The bootstrap tenant is exempt**, and a `Store` built without
+  `WithLimits` enforces nothing — so an existing self-hosted vault, the CLI,
+  and the TUI are all unaffected.
+- A quota rejection is reported as a readable tool error naming the limit and
+  how to recover, not as a generic "internal error". Reads are never blocked,
+  so a tenant at its cap can still search and delete its way back under.
+- `TenantForKey` now returns the tenant's plan from the same join, so
+  applying limits costs no extra query per request.
+
 **Multi-tenant backups, and a vector-search recall fix.** Both close gaps
 opened by the move to row-level security.
 

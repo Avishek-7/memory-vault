@@ -22,6 +22,7 @@ import (
 
 	"memory-vault/internal/chat"
 	"memory-vault/internal/embed"
+	"memory-vault/internal/ratelimit"
 	"memory-vault/internal/store"
 )
 
@@ -289,6 +290,30 @@ func internalErr(context string, err error) map[string]interface{} {
 	return errResult("internal error")
 }
 
+// quotaResult renders a quota rejection as a message the user can act on,
+// returning nil for any other error (including none). A quota is a fact about
+// the caller's plan, not a server fault, so it must not go through
+// internalErr and come back as a generic "internal error" the user cannot
+// interpret or fix.
+func quotaResult(err error) map[string]interface{} {
+	var quota *store.QuotaError
+	if !errors.As(err, &quota) {
+		return nil
+	}
+	switch quota.Resource {
+	case "memories":
+		return errResult(fmt.Sprintf(
+			"memory limit reached: this plan allows %d memories and %d are already stored. "+
+				"Delete some (delete_memory) or merge them (compact_memories) to free space.",
+			quota.Limit, quota.Current))
+	default:
+		return errResult(fmt.Sprintf(
+			"storage limit reached: this plan allows %.1f MB and %.1f MB are already stored; "+
+				"this write would add %.1f KB. Delete or compact some memories to free space.",
+			float64(quota.Limit)/(1<<20), float64(quota.Current)/(1<<20), float64(quota.Adding)/1024))
+	}
+}
+
 // compactTargetName picks the name a compacted group is saved under: the
 // original name for a solo re-summarization, or a "-merged" name when
 // multiple sources are combined.
@@ -471,6 +496,9 @@ func callTool(vault *store.Store, name string, args map[string]interface{}) map[
 			}
 		} else {
 			numChunks, err = vault.SaveMemory(space, n, content, source, kind)
+		}
+		if quotaErr := quotaResult(err); quotaErr != nil {
+			return quotaErr
 		}
 		if err != nil {
 			return internalErr("save_memory", err)
@@ -671,6 +699,9 @@ func callTool(vault *store.Store, name string, args map[string]interface{}) map[
 		sourceOverride, _ := args["source"].(string)
 		overwrite, _ := args["overwrite"].(bool)
 		res, err := vault.Import(items, spaceOverride, sourceOverride, overwrite)
+		if quotaErr := quotaResult(err); quotaErr != nil {
+			return quotaErr
+		}
 		if err != nil {
 			return internalErr("import_memories", err)
 		}
@@ -820,6 +851,25 @@ func authTokens() []string {
 	return strings.Split(raw, ",")
 }
 
+// tenantLimiter holds the per-tenant request buckets. Buckets untouched for
+// an hour are swept, so a server that has seen many tenants over months does
+// not accumulate one entry per tenant forever.
+var tenantLimiter = ratelimit.New(time.Hour)
+
+// planLimits returns a plan's caps, with each value overridable by
+// environment variable (PLAN_FREE_RPM, PLAN_BUILDER_MAX_MEMORIES, ...) so an
+// operator can change the economics without a code change. Setting any of
+// them to 0 removes that limit for the plan.
+func planLimits(plan string) store.PlanLimits {
+	l := store.LimitsForPlan(plan)
+	prefix := "PLAN_" + strings.ToUpper(plan) + "_"
+	l.RequestsPerMinute = envOrInt(prefix+"RPM", l.RequestsPerMinute)
+	l.Burst = envOrInt(prefix+"BURST", l.Burst)
+	l.MaxMemories = envOrInt(prefix+"MAX_MEMORIES", l.MaxMemories)
+	l.MaxContentBytes = int64(envOrInt(prefix+"MAX_MB", int(l.MaxContentBytes>>20))) << 20
+	return l
+}
+
 // matchesAuthToken reports whether token is one of the AUTH_TOKEN values.
 // AUTH_TOKEN keeps exactly its pre-multi-tenancy meaning — a shared static
 // credential for the bootstrap tenant — so existing self-hosted clients keep
@@ -851,13 +901,13 @@ func authenticate(r *http.Request) (*store.Store, bool) {
 	}
 
 	if token != "" {
-		tenantID, err := st.TenantForKey(token)
+		tenantID, plan, err := st.TenantForKey(token)
 		if err != nil {
 			log.Printf("auth: resolving api key: %v", err)
 			return nil, false
 		}
 		if tenantID != "" {
-			return st.ForTenant(tenantID), true
+			return st.ForTenant(tenantID).WithLimits(planLimits(plan)), true
 		}
 		// Unknown or revoked key: falls through to the open-vault check
 		// below rather than rejecting outright. On a vault that serves
@@ -948,6 +998,24 @@ func mcpHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="memory-vault"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
+	}
+
+	// Rate limiting comes after authentication on purpose: the bucket is per
+	// tenant, so there is nothing to charge until we know whose request this
+	// is. An unlimited plan (the bootstrap tenant) short-circuits inside
+	// Allow without allocating anything.
+	if limits := vault.Limits(); limits.RequestsPerMinute > 0 {
+		tenant := vault.TenantID()
+		if !tenantLimiter.Allow(tenant, limits.RequestsPerMinute, limits.Burst) {
+			retry := tenantLimiter.RetryAfter(tenant, limits.RequestsPerMinute)
+			seconds := int(retry.Seconds())
+			if seconds < 1 {
+				seconds = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(seconds))
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
 	}
 	if r.Method == http.MethodDelete {
 		w.WriteHeader(http.StatusNoContent)
