@@ -762,6 +762,28 @@ func (s *Store) saveMemory(space, name, content, source, kind string, overwrite 
 			return false, 0, err
 		}
 	}
+	// A non-overwrite write to a name that already exists is a no-op: the
+	// insert below would hit the primary key and be skipped. Detect that
+	// before the quota check, because charging the incoming payload against
+	// the tenant's cap for a write that will never happen can fail an import
+	// that would have changed nothing — and Import aborts on the first error,
+	// so one oversized duplicate takes the whole restore down with it.
+	//
+	// This is an optimisation, not the guard: the unique violation below
+	// remains authoritative for a concurrent writer that inserts between this
+	// check and ours.
+	if !overwrite {
+		var exists bool
+		if err := tx.QueryRow(
+			`SELECT EXISTS (SELECT 1 FROM memories WHERE space = $1 AND name = $2)`, space, name,
+		).Scan(&exists); err != nil {
+			return false, 0, err
+		}
+		if exists {
+			return false, 0, nil
+		}
+	}
+
 	// Quota is checked here, inside the transaction and after any overwrite
 	// delete above. It excludes this (space, name) from current usage and
 	// charges it once, so replacing an existing memory — by overwrite, or by

@@ -318,3 +318,42 @@ func TestFallbackPlanExists(t *testing.T) {
 		t.Error("an unrecognised plan resolved to unlimited; the fallback must be the strictest plan")
 	}
 }
+
+// TestImportOfALargerDuplicateIsSkippedNotRejected covers the gap my first
+// fix left: excluding the existing copy from usage still charged the INCOMING
+// payload, so importing a duplicate larger than the stored copy could trip
+// MaxContentBytes for a write that will never happen. Import aborts on the
+// first error, so one oversized duplicate took the whole restore down.
+func TestImportOfALargerDuplicateIsSkippedNotRejected(t *testing.T) {
+	st := setupTenantDB(t)
+	makeTenant(t, st, tenantAID, "a@example.test")
+	tenant := st.ForTenant(tenantAID).WithLimits(PlanLimits{MaxContentBytes: 300})
+	t.Cleanup(func() {
+		tenant.DeleteMemory("imp-big", "existing")
+		tenant.DeleteMemory("imp-big", "fresh")
+	})
+
+	if _, err := tenant.SaveMemory("imp-big", "existing", strings.Repeat("a", 100), DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+
+	// The incoming copy is far bigger than the cap allows on top of what is
+	// stored — but it will be skipped, so it must not be charged at all.
+	// A second, genuinely new memory follows it to prove the import as a
+	// whole survives rather than aborting on the duplicate.
+	res, err := tenant.Import([]MemoryExport{
+		{Name: "existing", Space: "imp-big", Content: strings.Repeat("b", 5000)},
+		{Name: "fresh", Space: "imp-big", Content: strings.Repeat("c", 100)},
+	}, "", "", false)
+	if err != nil {
+		t.Fatalf("import containing an oversized duplicate was rejected: %v", err)
+	}
+	if len(res.Skipped) != 1 || len(res.Imported) != 1 {
+		t.Errorf("Import imported=%v skipped=%v, want the duplicate skipped and the new one imported",
+			res.Imported, res.Skipped)
+	}
+	// And the stored copy must be untouched by the skipped write.
+	if got, _ := tenant.Reassemble("imp-big", "existing"); got != strings.Repeat("a", 100) {
+		t.Errorf("the skipped duplicate modified the stored memory (len %d)", len(got))
+	}
+}

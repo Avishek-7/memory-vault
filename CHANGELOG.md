@@ -42,6 +42,12 @@ Fixed in review of the above:
   is the single source of truth for that mapping.
 - `Retry-After` truncated fractional delays, so a 1.33s wait was advertised as
   1s and a compliant client retried early into another 429. It now rounds up.
+- A non-overwrite write to a name that already exists now short-circuits
+  before the quota check. It was already going to be skipped by the primary
+  key, but charging the incoming payload against the cap could reject an
+  import that would have changed nothing — and since `Import` aborts on the
+  first error, one oversized duplicate took the whole restore with it. The
+  unique violation remains authoritative for the concurrent case.
 - Quotas no longer double-charge a memory that already exists. Usage is
   measured excluding the `(space, name)` being written, then charged once —
   so re-importing a backup a tenant already holds is skipped as intended
