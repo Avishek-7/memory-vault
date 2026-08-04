@@ -60,12 +60,17 @@ func TestAPIKeyResolvesToItsTenant(t *testing.T) {
 		t.Fatalf("CreateAPIKey: %v", err)
 	}
 
-	got, err := st.TenantForKey(key)
+	got, plan, err := st.TenantForKey(key)
 	if err != nil {
 		t.Fatalf("TenantForKey: %v", err)
 	}
 	if got != tenantAID {
 		t.Errorf("TenantForKey resolved to %q, want %q", got, tenantAID)
+	}
+	// The plan comes back from the same lookup, so the caller can apply the
+	// tenant's limits without a second query.
+	if plan != "free" {
+		t.Errorf("TenantForKey returned plan %q, want the tenant's default %q", plan, "free")
 	}
 
 	// The plaintext must not be recoverable from the table — that is the
@@ -97,10 +102,10 @@ func TestUnknownAndRevokedKeysAreRejected(t *testing.T) {
 	clearAPIKeys(t, st)
 	makeTenant(t, st, tenantAID, "a@example.test")
 
-	if got, err := st.TenantForKey("mv_this-key-was-never-issued"); err != nil || got != "" {
+	if got, _, err := st.TenantForKey("mv_this-key-was-never-issued"); err != nil || got != "" {
 		t.Errorf("TenantForKey(unknown) = (%q, %v), want (\"\", nil)", got, err)
 	}
-	if got, err := st.TenantForKey(""); err != nil || got != "" {
+	if got, _, err := st.TenantForKey(""); err != nil || got != "" {
 		t.Errorf("TenantForKey(empty) = (%q, %v), want (\"\", nil)", got, err)
 	}
 
@@ -117,7 +122,7 @@ func TestUnknownAndRevokedKeysAreRejected(t *testing.T) {
 	if err != nil || !revoked {
 		t.Fatalf("RevokeAPIKey = (%v, %v), want (true, nil)", revoked, err)
 	}
-	if got, err := st.TenantForKey(key); err != nil || got != "" {
+	if got, _, err := st.TenantForKey(key); err != nil || got != "" {
 		t.Fatalf("revoked key still authenticates as %q (err %v)", got, err)
 	}
 	// Revoking twice is not a success: an operator re-running it should not
@@ -186,7 +191,7 @@ func TestKeyScopedStoresStayIsolated(t *testing.T) {
 	// Exactly the production path: key -> tenant id -> scoped store.
 	scoped := func(key string) *Store {
 		t.Helper()
-		id, err := st.TenantForKey(key)
+		id, _, err := st.TenantForKey(key)
 		if err != nil {
 			t.Fatalf("TenantForKey: %v", err)
 		}

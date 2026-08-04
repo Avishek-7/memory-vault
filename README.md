@@ -343,6 +343,42 @@ immediately. Issuing a key is a **one-way door**: revoking it later does not
 re-open the vault, so responding to a leaked key by revoking it can't
 accidentally leave `/mcp` open to everyone.
 
+## Plans, rate limits, and quotas
+
+Each tenant's `plan` (`free`, `builder`, or `team`) decides what it may
+consume. Limits are enforced in two places: request rate at the HTTP handler,
+storage quota inside the write transaction.
+
+| Plan | Requests/min | Burst | Memories | Storage |
+|---|---|---|---|---|
+| `free` | 60 | 30 | 200 | 10 MB |
+| `builder` | 600 | 120 | 5,000 | 500 MB |
+| `team` | 3,000 | 600 | 50,000 | 5 GB |
+
+**The bootstrap tenant is exempt.** A self-hosted vault — everything reached
+via `AUTH_TOKEN`, or anonymously on a vault that has never minted a key — runs
+with no limits at all, so this feature changes nothing for an existing
+single-tenant deployment.
+
+Override any value with `PLAN_<PLAN>_RPM`, `_BURST`, `_MAX_MEMORIES`, or
+`_MAX_MB` (e.g. `PLAN_FREE_MAX_MEMORIES=500`). Setting one to `0` removes that
+limit for the plan. An unrecognised plan name falls back to `free`'s limits
+rather than to no limits, so a typo cannot hand out unlimited storage.
+
+Exceeding the request rate returns HTTP `429` with a `Retry-After` header.
+Exceeding a storage quota fails the individual `save_memory`/`import_memories`
+call with a message naming the limit and what to do about it — reads are never
+blocked, so a tenant at its cap can still search and delete its way back under.
+
+Quotas count the whole tenant, across every space: spaces are a namespace, not
+a billing boundary.
+
+> Rate limit state is held in memory, so it is per instance and resets on
+> restart. That is exact for the intended deployment, which runs one active
+> instance (failover points DNS at a single host rather than load-balancing).
+> Running several instances behind a load balancer would let each one grant
+> the full rate independently, and would need shared counters instead.
+
 ## Configuration
 
 Environment variables:
@@ -362,6 +398,10 @@ Environment variables:
 | `MAX_REQUEST_BODY_MB` | `25` | Max `/mcp` request body size, in MB — guards against unbounded-memory requests (e.g. an oversized `import_memories` payload) |
 | `AUTH_TOKEN` | *(none)* | Shared bearer token(s) authenticating as the bootstrap tenant (comma-separated for multiple clients). If unset, `/mcp` is open only while no API key exists — see [Tenants and API keys](#tenants-and-api-keys) |
 | `ALLOWED_HOSTS` | *(none)* | Comma-separated `Host` header allowlist, guards against DNS-rebinding. If unset, the check is skipped — set this in production. |
+| `PLAN_<PLAN>_RPM` | per plan | Sustained requests/minute for `FREE`/`BUILDER`/`TEAM`; `0` disables the limit — see [Plans, rate limits, and quotas](#plans-rate-limits-and-quotas) |
+| `PLAN_<PLAN>_BURST` | per plan | How many requests an idle tenant may make at once (capped at that plan's `RPM`) |
+| `PLAN_<PLAN>_MAX_MEMORIES` | per plan | Maximum memories a tenant on that plan may store; `0` disables the limit |
+| `PLAN_<PLAN>_MAX_MB` | per plan | Maximum total stored content in MB for that plan; `0` disables the limit |
 | `DB_MAX_OPEN_CONNS` | `10` | Max open Postgres connections |
 | `DB_MAX_IDLE_CONNS` | `5` | Max idle Postgres connections |
 | `DB_CONN_MAX_LIFETIME_MIN` | `30` | Max connection lifetime, in minutes |

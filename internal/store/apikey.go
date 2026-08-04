@@ -51,22 +51,27 @@ func HashAPIKey(key string) string {
 // exposes these over HTTP must scope them itself; neither the compiler nor
 // RLS will catch it.
 
-// TenantForKey resolves a plaintext API key to the tenant that owns it.
-// Returns "" with no error when the key is unknown or revoked — an unknown
-// key is a routine failed authentication, not a server fault.
-func (s *Store) TenantForKey(key string) (string, error) {
-	var tenantID string
-	err := s.db.pool.QueryRow(
-		`SELECT tenant_id::text FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL`,
-		HashAPIKey(key),
-	).Scan(&tenantID)
+// TenantForKey resolves a plaintext API key to the tenant that owns it and
+// that tenant's plan. Returns "" with no error when the key is unknown or
+// revoked — an unknown key is a routine failed authentication, not a server
+// fault.
+//
+// The plan comes back from the same join rather than a second lookup: every
+// authenticated request needs it to know the tenant's limits, and paying two
+// round trips per request for one answer would be waste on the hot path.
+func (s *Store) TenantForKey(key string) (tenantID, plan string, err error) {
+	err = s.db.pool.QueryRow(`
+		SELECT k.tenant_id::text, t.plan
+		FROM api_keys k JOIN tenants t ON t.id = k.tenant_id
+		WHERE k.key_hash = $1 AND k.revoked_at IS NULL
+	`, HashAPIKey(key)).Scan(&tenantID, &plan)
 	if err == sql.ErrNoRows {
-		return "", nil
+		return "", "", nil
 	}
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return tenantID, nil
+	return tenantID, plan, nil
 }
 
 // HasMintedAPIKey reports whether an API key has ever been issued, revoked

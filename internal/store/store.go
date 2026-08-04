@@ -359,6 +359,10 @@ type Store struct {
 	db       *tenantDB
 	Embedder embed.Embedder
 	EmbedDim int
+	// limits caps what the bound tenant may store. The zero value is
+	// unlimited, so every existing caller — the CLI, the TUI, and any Store
+	// built without WithLimits — keeps its previous unrestricted behaviour.
+	limits PlanLimits
 }
 
 // ForTenant returns a copy of s whose queries run as the given tenant. It
@@ -758,6 +762,19 @@ func (s *Store) saveMemory(space, name, content, source, kind string, overwrite 
 			return false, 0, err
 		}
 	}
+	// Quota is checked here, inside the transaction and after any overwrite
+	// delete above, so replacing an existing memory is measured against the
+	// space it actually frees rather than counted twice.
+	//
+	// ponytail: two concurrent writes can both pass this check and land, so a
+	// tenant can overshoot its cap by roughly one in-flight write per
+	// connection. Closing that needs a per-tenant advisory lock, which would
+	// serialise every write for a limit that exists to stop unbounded growth,
+	// not to be exact to the byte.
+	if err := s.checkQuota(tx, chunkList); err != nil {
+		return false, 0, err
+	}
+
 	for i, chunk := range chunkList {
 		_, err = tx.Exec(`
 			INSERT INTO memories (space, name, chunk_index, content, embedding, source, kind, flag, flagged_at, flag_note, updated_at)

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -273,5 +275,45 @@ func TestIntegrationExportImportRoundTrip(t *testing.T) {
 	summary := mustText(t, "import_memories", callTool(st, "import_memories", map[string]interface{}{"data": payload, "space": "export-dst"}))
 	if !strings.Contains(summary, "skipped 2") {
 		t.Errorf("second import summary = %q, want it to report 2 skipped", summary)
+	}
+}
+
+// TestQuotaResult covers the rendering of a quota rejection without needing a
+// database or an embedding backend. The important property is that a quota is
+// NOT treated as a server fault: internalErr would log it and hand the user a
+// generic "internal error" they can neither interpret nor act on.
+func TestQuotaResult(t *testing.T) {
+	if got := quotaResult(nil); got != nil {
+		t.Errorf("quotaResult(nil) = %v, want nil", got)
+	}
+	if got := quotaResult(errors.New("connection refused")); got != nil {
+		t.Errorf("quotaResult(non-quota error) = %v, want nil so it falls through to internalErr", got)
+	}
+
+	mem := quotaResult(&store.QuotaError{Resource: "memories", Limit: 200, Current: 200, Adding: 1})
+	if mem == nil {
+		t.Fatal("quotaResult did not recognise a *store.QuotaError")
+	}
+	if mem["isError"] != true {
+		t.Error("a quota rejection should be marked isError")
+	}
+	text := mem["content"].([]map[string]string)[0]["text"]
+	for _, want := range []string{"200", "delete_memory", "compact_memories"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("memory-quota message %q does not mention %q, so the user is not told how to recover", text, want)
+		}
+	}
+
+	bytes := quotaResult(&store.QuotaError{Resource: "storage", Limit: 10 << 20, Current: 10 << 20, Adding: 2048})
+	btext := bytes["content"].([]map[string]string)[0]["text"]
+	if !strings.Contains(btext, "10.0 MB") {
+		t.Errorf("storage-quota message %q does not report the limit in human units", btext)
+	}
+
+	// A wrapped quota error must still be recognised: saveMemory's callers
+	// may wrap on the way out.
+	wrapped := fmt.Errorf("saving: %w", &store.QuotaError{Resource: "memories", Limit: 5, Current: 5, Adding: 1})
+	if quotaResult(wrapped) == nil {
+		t.Error("quotaResult missed a wrapped *store.QuotaError; errors.As should see through the wrapping")
 	}
 }
