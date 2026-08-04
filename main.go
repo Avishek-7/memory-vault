@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -861,6 +862,11 @@ var tenantLimiter = ratelimit.New(time.Hour)
 // operator can change the economics without a code change. Setting any of
 // them to 0 removes that limit for the plan.
 func planLimits(plan string) store.PlanLimits {
+	// Both the limits and the override prefix have to come from the SAME
+	// name. Deriving the prefix from the raw value meant an unrecognised plan
+	// loaded free's defaults but then looked for PLAN_<TYPO>_* overrides,
+	// silently ignoring the PLAN_FREE_* limits the operator had configured.
+	plan = store.CanonicalPlan(plan)
 	l := store.LimitsForPlan(plan)
 	prefix := "PLAN_" + strings.ToUpper(plan) + "_"
 	l.RequestsPerMinute = envOrInt(prefix+"RPM", l.RequestsPerMinute)
@@ -868,6 +874,19 @@ func planLimits(plan string) store.PlanLimits {
 	l.MaxMemories = envOrInt(prefix+"MAX_MEMORIES", l.MaxMemories)
 	l.MaxContentBytes = int64(envOrInt(prefix+"MAX_MB", int(l.MaxContentBytes>>20))) << 20
 	return l
+}
+
+// retryAfterSeconds converts a refill delay into the whole seconds a
+// Retry-After header carries. It rounds UP: truncating 1.3s to 1 tells a
+// compliant client to retry before a token exists, which just earns it
+// another 429. Never returns less than 1, since Retry-After: 0 invites an
+// immediate retry.
+func retryAfterSeconds(d time.Duration) int {
+	seconds := int(math.Ceil(d.Seconds()))
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }
 
 // matchesAuthToken reports whether token is one of the AUTH_TOKEN values.
@@ -1008,11 +1027,7 @@ func mcpHandler(w http.ResponseWriter, r *http.Request) {
 		tenant := vault.TenantID()
 		if !tenantLimiter.Allow(tenant, limits.RequestsPerMinute, limits.Burst) {
 			retry := tenantLimiter.RetryAfter(tenant, limits.RequestsPerMinute)
-			seconds := int(retry.Seconds())
-			if seconds < 1 {
-				seconds = 1
-			}
-			w.Header().Set("Retry-After", strconv.Itoa(seconds))
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(retry)))
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}

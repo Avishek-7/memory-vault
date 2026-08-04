@@ -205,3 +205,43 @@ func TestConcurrentAccessIsSafe(t *testing.T) {
 		t.Errorf("%d requests allowed under concurrency, want exactly the burst of 100", allowed)
 	}
 }
+
+// TestShortIdleTTLIsClamped guards against eviction becoming a way to earn
+// tokens. Deleting a bucket is equivalent to refilling it instantly, since
+// the next request from that tenant gets a fresh full one — so an idleTTL
+// shorter than a bucket's natural refill time would let an exhausted tenant
+// come back early just because another tenant's request triggered a sweep.
+func TestShortIdleTTLIsClamped(t *testing.T) {
+	l, clock := newTestLimiter(10 * time.Second)
+	if l.idleTTL < minIdleTTL {
+		t.Fatalf("New kept idleTTL at %v, want it clamped to at least %v", l.idleTTL, minIdleTTL)
+	}
+
+	// One request per minute: after spending it, the tenant must wait a full
+	// minute even if other tenants keep arriving and triggering sweeps.
+	const perMinute = 1
+	if !l.Allow("a", perMinute, 1) {
+		t.Fatal("first request denied")
+	}
+	clock.Advance(11 * time.Second)
+	l.Allow("b", perMinute, 1) // a new tenant triggers sweepLocked
+	if l.Allow("a", perMinute, 1) {
+		t.Error("tenant A got a fresh allowance 11s into a 60s refill because its bucket was evicted")
+	}
+
+	// Past the real refill period it is allowed again, as normal.
+	clock.Advance(60 * time.Second)
+	if !l.Allow("a", perMinute, 1) {
+		t.Error("tenant A was still blocked after a full minute")
+	}
+}
+
+func TestZeroIdleTTLDisablesEviction(t *testing.T) {
+	l, clock := newTestLimiter(0)
+	l.Allow("a", 60, 60)
+	clock.Advance(24 * time.Hour)
+	l.Allow("b", 60, 60)
+	if l.Len() != 2 {
+		t.Errorf("Len = %d with eviction disabled, want both buckets retained", l.Len())
+	}
+}

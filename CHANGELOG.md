@@ -29,6 +29,24 @@ the disk.
 - `TenantForKey` now returns the tenant's plan from the same join, so
   applying limits costs no extra query per request.
 
+Fixed in review of the above:
+
+- Storage quotas counted CHARACTERS, not bytes. Postgres `length()` counts
+  characters while Go's `len()` counts bytes, so every non-ASCII memory was
+  undercounted on read and charged at full size on write — a tenant storing
+  emoji or non-Latin script could exceed `MaxContentBytes`. Both queries now
+  use `octet_length`.
+- An unrecognised plan loaded `free`'s limits but derived its override prefix
+  from the raw name, so it looked for `PLAN_<TYPO>_*` and silently ignored the
+  `PLAN_FREE_*` values an operator had configured. New `store.CanonicalPlan`
+  is the single source of truth for that mapping.
+- `Retry-After` truncated fractional delays, so a 1.33s wait was advertised as
+  1s and a compliant client retried early into another 429. It now rounds up.
+- `ratelimit.New` clamps a positive `idleTTL` to at least a minute. Evicting a
+  bucket is equivalent to refilling it instantly, so a shorter TTL let an
+  exhausted tenant regain a full allowance early when any other tenant's
+  request triggered a sweep.
+
 **Multi-tenant backups, and a vector-search recall fix.** Both close gaps
 opened by the move to row-level security.
 

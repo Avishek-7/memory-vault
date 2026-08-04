@@ -17,8 +17,10 @@ type PlanLimits struct {
 	Burst int
 	// MaxMemories caps distinct memory names across all of a tenant's spaces.
 	MaxMemories int
-	// MaxContentBytes caps the total stored content, measured the same way
-	// the memories themselves are: the sum of every chunk's length.
+	// MaxContentBytes caps the total stored content in BYTES. The queries
+	// use octet_length rather than length because Postgres's length() counts
+	// CHARACTERS while Go's len() counts bytes — mixing them undercounts
+	// every non-ASCII memory and lets a tenant past its cap.
 	MaxContentBytes int64
 }
 
@@ -38,15 +40,29 @@ var DefaultPlanLimits = map[string]PlanLimits{
 	"team":    {RequestsPerMinute: 3000, Burst: 600, MaxMemories: 50000, MaxContentBytes: 5 << 30}, // 5 GB
 }
 
-// LimitsForPlan returns the caps for a plan name, falling back to the
-// strictest built-in plan for anything unrecognised. Failing closed matters:
-// a typo or a plan added to the database ahead of the code should not
-// silently grant unlimited storage.
-func LimitsForPlan(plan string) PlanLimits {
-	if l, ok := DefaultPlanLimits[plan]; ok {
-		return l
+// FallbackPlan is what an unrecognised plan name resolves to — the
+// strictest built-in plan, so a typo or a plan added to the database ahead of
+// the code cannot silently grant unlimited storage.
+const FallbackPlan = "free"
+
+// CanonicalPlan maps a plan name to one the code knows about, collapsing
+// anything unrecognised to FallbackPlan.
+//
+// Callers need this and not just LimitsForPlan: anything deriving a name from
+// the plan — an environment variable prefix, a metric label — must use the
+// same name the limits actually came from, or it will read configuration that
+// does not exist while believing it applied.
+func CanonicalPlan(plan string) string {
+	if _, ok := DefaultPlanLimits[plan]; ok {
+		return plan
 	}
-	return DefaultPlanLimits["free"]
+	return FallbackPlan
+}
+
+// LimitsForPlan returns the caps for a plan name, falling back to the
+// strictest built-in plan for anything unrecognised.
+func LimitsForPlan(plan string) PlanLimits {
+	return DefaultPlanLimits[CanonicalPlan(plan)]
 }
 
 // QuotaError is returned by a write that would take a tenant past one of its
@@ -96,7 +112,7 @@ func (s *Store) Usage() (Usage, error) {
 	// rows own the transaction they are read from; a bare *sql.Row would
 	// leave that transaction open.
 	rows, err := s.db.Query(`
-		SELECT count(DISTINCT (space, name)), coalesce(sum(length(content)), 0) FROM memories
+		SELECT count(DISTINCT (space, name)), coalesce(sum(octet_length(content)), 0) FROM memories
 	`)
 	if err != nil {
 		return Usage{}, err
@@ -131,7 +147,7 @@ func (s *Store) checkQuota(tx *sql.Tx, chunks []string) error {
 	var count int64
 	var bytes int64
 	if err := tx.QueryRow(`
-		SELECT count(DISTINCT (space, name)), coalesce(sum(length(content)), 0) FROM memories
+		SELECT count(DISTINCT (space, name)), coalesce(sum(octet_length(content)), 0) FROM memories
 	`).Scan(&count, &bytes); err != nil {
 		return fmt.Errorf("reading quota usage: %w", err)
 	}

@@ -35,8 +35,23 @@ type Limiter struct {
 	now     func() time.Time // injectable for tests
 }
 
-// New returns a Limiter that forgets buckets untouched for idleTTL.
+// minIdleTTL is the floor New clamps idleTTL to.
+//
+// Evicting a bucket is equivalent to refilling it instantly, because the next
+// request from that tenant creates a full one. A TTL shorter than the time a
+// bucket needs to refill naturally (at most a minute, since rates are
+// per-minute) would therefore hand an exhausted tenant a fresh allowance
+// early — eviction is a memory optimisation and must never be a way to earn
+// tokens faster.
+const minIdleTTL = time.Minute
+
+// New returns a Limiter that forgets buckets untouched for idleTTL. A
+// positive idleTTL below minIdleTTL is raised to it; zero or negative
+// disables eviction entirely.
 func New(idleTTL time.Duration) *Limiter {
+	if idleTTL > 0 && idleTTL < minIdleTTL {
+		idleTTL = minIdleTTL
+	}
 	return &Limiter{
 		buckets: make(map[string]*bucket),
 		idleTTL: idleTTL,

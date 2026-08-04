@@ -181,3 +181,73 @@ func TestQuotaCountsAcrossSpaces(t *testing.T) {
 		t.Fatalf("a third space escaped the cap (%v); quotas must count the whole tenant", err)
 	}
 }
+
+// TestQuotaMeasuresBytesNotCharacters guards a mismatch that silently let
+// tenants past their cap: Postgres length() counts CHARACTERS while Go's
+// len() counts BYTES, so every non-ASCII memory was undercounted on read and
+// charged at full size on write. A tenant storing emoji or non-Latin script
+// could exceed MaxContentBytes by the difference.
+func TestQuotaMeasuresBytesNotCharacters(t *testing.T) {
+	st := setupTenantDB(t)
+	makeTenant(t, st, tenantAID, "a@example.test")
+	tenant := st.ForTenant(tenantAID)
+	t.Cleanup(func() { tenant.DeleteMemory("utf8", "multibyte") })
+
+	// Every rune here is multibyte, so characters and bytes differ sharply.
+	content := strings.Repeat("é", 100) // 100 characters, 200 bytes
+	wantBytes := int64(len(content))
+	if wantBytes != 200 {
+		t.Fatalf("test fixture is wrong: %d bytes, want 200", wantBytes)
+	}
+	if _, err := tenant.SaveMemory("utf8", "multibyte", content, DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("SaveMemory: %v", err)
+	}
+
+	usage, err := tenant.Usage()
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if usage.ContentBytes != wantBytes {
+		t.Errorf("Usage.ContentBytes = %d for %d bytes of multibyte content — usage is being "+
+			"measured in characters, so a tenant can exceed its byte quota", usage.ContentBytes, wantBytes)
+	}
+}
+
+// TestByteQuotaCannotBeExceededWithMultibyteContent is the same bug seen from
+// the enforcement side rather than the reporting side.
+func TestByteQuotaCannotBeExceededWithMultibyteContent(t *testing.T) {
+	st := setupTenantDB(t)
+	makeTenant(t, st, tenantAID, "a@example.test")
+	// 300-byte cap. Two 200-byte writes must not both fit.
+	tenant := st.ForTenant(tenantAID).WithLimits(PlanLimits{MaxContentBytes: 300})
+	t.Cleanup(func() {
+		tenant.DeleteMemory("utf8-cap", "first")
+		tenant.DeleteMemory("utf8-cap", "second")
+	})
+
+	content := strings.Repeat("é", 100) // 200 bytes
+	if _, err := tenant.SaveMemory("utf8-cap", "first", content, DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("first 200-byte write under a 300-byte cap failed: %v", err)
+	}
+	_, err := tenant.SaveMemory("utf8-cap", "second", content, DefaultSource, DefaultKind)
+	var quota *QuotaError
+	if !errors.As(err, &quota) {
+		t.Fatalf("a second 200-byte write fit under a 300-byte cap (%v); usage must be "+
+			"counted in bytes, not characters", err)
+	}
+}
+
+func TestCanonicalPlan(t *testing.T) {
+	for _, plan := range []string{"free", "builder", "team"} {
+		if got := CanonicalPlan(plan); got != plan {
+			t.Errorf("CanonicalPlan(%q) = %q, want it unchanged", plan, got)
+		}
+	}
+	// Anything unrecognised must collapse to the same name its limits come
+	// from, so callers deriving config keys from it read real configuration.
+	for _, plan := range []string{"typo", "", "TEAM", "enterprise"} {
+		if got := CanonicalPlan(plan); got != FallbackPlan {
+			t.Errorf("CanonicalPlan(%q) = %q, want %q", plan, got, FallbackPlan)
+		}
+	}
+}
