@@ -54,6 +54,12 @@ Fixed in review of the above:
   rather than rejected, and an import no longer aborts on the first
   duplicate. Overwriting a memory that consumes a tenant's whole quota
   works too.
+- `compact_memories` now refuses a merge that comes back larger than the
+  sources it would replace, reporting the group as skipped with the sources
+  left intact. Nothing bounds a chat model's output length, so without this
+  the quota exemption below was a way around the cap: the merged memory is
+  written unlimited and the sources are then deleted, leaving a tenant
+  permanently over `MaxContentBytes`.
 - `compact_memories` is exempt from quota. It writes the merged memory
   before deleting the sources it replaces (the safe order), so usage
   transiently holds both — meaning a tenant at their cap could not compact,

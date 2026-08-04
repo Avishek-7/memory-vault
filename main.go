@@ -155,7 +155,9 @@ func argSpace(args map[string]interface{}) string {
 // ollamaChat sends a single-turn prompt to the local Ollama chat model and
 // returns its response text. Used by compact_memories and
 // get_session_summary, never search/save.
-func ollamaChat(prompt string) (string, error) {
+// ollamaChat is a var, not a func, purely so tests can substitute a model
+// response without a live Ollama.
+var ollamaChat = func(prompt string) (string, error) {
 	return chat.Chat(ollamaURL(), ollamaChatModel(), prompt)
 }
 
@@ -427,11 +429,13 @@ func compactGroup(vault *store.Store, space string, g []store.MemoryCentroid, dr
 	}
 
 	var parts []string
+	sourceBytes := 0
 	for _, m := range g {
 		content, err := vault.Reassemble(space, m.Name)
 		if err != nil {
 			return "", err
 		}
+		sourceBytes += len(content)
 		parts = append(parts, fmt.Sprintf("--- %s ---\n%s", m.Name, content))
 	}
 	prompt := fmt.Sprintf("The following are related notes. Merge them into a single consolidated note that preserves every distinct fact and drops redundancy. Respond with only the merged note text, no preamble.\n\n%s", strings.Join(parts, "\n\n"))
@@ -452,6 +456,20 @@ func compactGroup(vault *store.Store, space string, g []store.MemoryCentroid, dr
 	if len(g) == 1 {
 		mergedSource, mergedKind = g[0].Source, g[0].Kind
 	}
+	// Compaction must actually shrink storage, or the quota exemption below
+	// becomes a way around the cap: the merged memory is written without a
+	// limit and the sources are then deleted, so a model that returns MORE
+	// than it was given would leave the tenant permanently over quota. There
+	// is nothing bounding a chat model's output length, so this is checked
+	// rather than assumed. Skipping the group is right: the sources are still
+	// intact, and nothing has been written.
+	if len(merged) > sourceBytes {
+		log.Printf("compact_memories: space=%q sources=%v produced %d bytes from %d bytes of sources, skipping",
+			space, names, len(merged), sourceBytes)
+		return fmt.Sprintf("space %q: [%s] -> skipped (the merge came back larger than the %d bytes it would replace)",
+			space, strings.Join(names, ", "), sourceBytes), nil
+	}
+
 	// Exempt from quota on purpose. compactGroup writes the merged memory
 	// BEFORE deleting the sources it replaces — the safe order, since losing
 	// the sources to a failed save would destroy data — which means usage
