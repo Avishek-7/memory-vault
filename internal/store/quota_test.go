@@ -251,3 +251,70 @@ func TestCanonicalPlan(t *testing.T) {
 		}
 	}
 }
+
+// TestImportOfAnExistingMemoryIsNotDoubleCharged covers the non-overwrite
+// path, where the existing rows are NOT deleted before the quota check.
+// Counting them alongside the incoming copy charged the same memory twice,
+// which could fail an import of a backup the tenant already holds — and
+// Import returns on the first error, so that aborted the whole import
+// instead of skipping the duplicate.
+func TestImportOfAnExistingMemoryIsNotDoubleCharged(t *testing.T) {
+	st := setupTenantDB(t)
+	makeTenant(t, st, tenantAID, "a@example.test")
+	content := strings.Repeat("x", 100)
+	// Room for exactly one copy plus a little slack — enough that the memory
+	// fits, but not twice.
+	tenant := st.ForTenant(tenantAID).WithLimits(PlanLimits{MaxMemories: 1, MaxContentBytes: 150})
+	t.Cleanup(func() { tenant.DeleteMemory("imp", "existing") })
+
+	if _, err := tenant.SaveMemory("imp", "existing", content, DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+
+	// Re-importing the same memory without overwrite must skip it, not be
+	// rejected for exceeding a quota it already fits inside.
+	res, err := tenant.Import([]MemoryExport{{
+		Name: "existing", Space: "imp", Source: DefaultSource, Kind: DefaultKind, Content: content,
+	}}, "", "", false)
+	if err != nil {
+		t.Fatalf("re-importing an already-stored memory was rejected: %v", err)
+	}
+	if len(res.Skipped) != 1 {
+		t.Errorf("Import skipped %v, want the single duplicate skipped", res.Skipped)
+	}
+}
+
+// TestOverwriteAtTheByteCapStillWorks is the same exclusion seen from the
+// overwrite side: a tenant whose storage is entirely consumed by one memory
+// must still be able to replace it with content of a similar size.
+func TestOverwriteAtTheByteCapStillWorks(t *testing.T) {
+	st := setupTenantDB(t)
+	makeTenant(t, st, tenantAID, "a@example.test")
+	tenant := st.ForTenant(tenantAID).WithLimits(PlanLimits{MaxContentBytes: 120})
+	t.Cleanup(func() { tenant.DeleteMemory("ow-cap", "only") })
+
+	if _, err := tenant.SaveMemory("ow-cap", "only", strings.Repeat("a", 100), DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+	if _, err := tenant.SaveMemory("ow-cap", "only", strings.Repeat("b", 100), DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("replacing a memory that consumes the whole quota was rejected: %v", err)
+	}
+	usage, err := tenant.Usage()
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if usage.ContentBytes != 100 {
+		t.Errorf("after overwrite usage = %d bytes, want 100 — the replaced copy is still counted", usage.ContentBytes)
+	}
+}
+
+func TestFallbackPlanExists(t *testing.T) {
+	// init() panics if this is violated, so reaching the test at all proves
+	// it; asserting explicitly documents why the init exists.
+	if _, ok := DefaultPlanLimits[FallbackPlan]; !ok {
+		t.Fatalf("FallbackPlan %q missing from DefaultPlanLimits", FallbackPlan)
+	}
+	if LimitsForPlan("nonexistent-plan") == Unlimited {
+		t.Error("an unrecognised plan resolved to unlimited; the fallback must be the strictest plan")
+	}
+}

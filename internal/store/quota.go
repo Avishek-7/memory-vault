@@ -45,6 +45,18 @@ var DefaultPlanLimits = map[string]PlanLimits{
 // the code cannot silently grant unlimited storage.
 const FallbackPlan = "free"
 
+// The fallback plan must exist, or LimitsForPlan's map lookup would return
+// the zero PlanLimits — which this package defines as UNLIMITED, the exact
+// opposite of the fail-closed behaviour the fallback exists to provide.
+// Renaming a tier without updating FallbackPlan would otherwise hand every
+// tenant unlimited storage silently, so it fails at startup instead.
+func init() {
+	if _, ok := DefaultPlanLimits[FallbackPlan]; !ok {
+		panic("store: FallbackPlan " + FallbackPlan + " is not present in DefaultPlanLimits, " +
+			"so an unrecognised plan would resolve to unlimited instead of the strictest plan")
+	}
+}
+
 // CanonicalPlan maps a plan name to one the code knows about, collapsing
 // anything unrecognised to FallbackPlan.
 //
@@ -134,7 +146,7 @@ func (s *Store) Usage() (Usage, error) {
 // A zero-limit plan short-circuits before touching the database, which is the
 // bootstrap tenant's path on every single write — the unlimited case must not
 // cost a query.
-func (s *Store) checkQuota(tx *sql.Tx, chunks []string) error {
+func (s *Store) checkQuota(tx *sql.Tx, space, name string, chunks []string) error {
 	if s.limits.MaxMemories <= 0 && s.limits.MaxContentBytes <= 0 {
 		return nil
 	}
@@ -144,16 +156,22 @@ func (s *Store) checkQuota(tx *sql.Tx, chunks []string) error {
 		adding += int64(len(c))
 	}
 
+	// Usage is measured EXCLUDING the memory being written, then that memory
+	// is charged once below. On the overwrite path its rows were already
+	// deleted, so the exclusion changes nothing. On the non-overwrite path
+	// (Import without overwrite) they are still present, and counting them
+	// alongside the incoming copy charged the same memory twice — enough to
+	// fail an import of a backup a tenant already holds, which then aborted
+	// the whole import instead of skipping the duplicate.
 	var count int64
 	var bytes int64
 	if err := tx.QueryRow(`
-		SELECT count(DISTINCT (space, name)), coalesce(sum(octet_length(content)), 0) FROM memories
-	`).Scan(&count, &bytes); err != nil {
+		SELECT count(DISTINCT (space, name)), coalesce(sum(octet_length(content)), 0)
+		FROM memories WHERE NOT (space = $1 AND name = $2)
+	`, space, name).Scan(&count, &bytes); err != nil {
 		return fmt.Errorf("reading quota usage: %w", err)
 	}
 
-	// The memory being written was deleted above when overwriting, so it is
-	// not in `count`; it always costs one new name here.
 	if s.limits.MaxMemories > 0 && count+1 > int64(s.limits.MaxMemories) {
 		return &QuotaError{Resource: "memories", Limit: int64(s.limits.MaxMemories), Current: count, Adding: 1}
 	}

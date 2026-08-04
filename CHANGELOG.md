@@ -42,6 +42,18 @@ Fixed in review of the above:
   is the single source of truth for that mapping.
 - `Retry-After` truncated fractional delays, so a 1.33s wait was advertised as
   1s and a compliant client retried early into another 429. It now rounds up.
+- Quotas no longer double-charge a memory that already exists. Usage is
+  measured excluding the `(space, name)` being written, then charged once —
+  so re-importing a backup a tenant already holds is skipped as intended
+  rather than rejected, and an import no longer aborts on the first
+  duplicate. Overwriting a memory that consumes a tenant's whole quota
+  works too.
+- `compact_memories` is exempt from quota. It writes the merged memory
+  before deleting the sources it replaces (the safe order), so usage
+  transiently holds both — meaning a tenant at their cap could not compact,
+  which is exactly what they are told to do to get back under it. The
+  compaction path also reports quota errors readably instead of as a
+  generic internal error.
 - `ratelimit.New` clamps a positive `idleTTL` to at least a minute. Evicting a
   bucket is equivalent to refilling it instantly, so a shorter TTL let an
   exhausted tenant regain a full allowance early when any other tenant's

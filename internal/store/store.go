@@ -763,15 +763,16 @@ func (s *Store) saveMemory(space, name, content, source, kind string, overwrite 
 		}
 	}
 	// Quota is checked here, inside the transaction and after any overwrite
-	// delete above, so replacing an existing memory is measured against the
-	// space it actually frees rather than counted twice.
+	// delete above. It excludes this (space, name) from current usage and
+	// charges it once, so replacing an existing memory — by overwrite, or by
+	// an import that will skip it — is never counted twice.
 	//
 	// ponytail: two concurrent writes can both pass this check and land, so a
 	// tenant can overshoot its cap by roughly one in-flight write per
 	// connection. Closing that needs a per-tenant advisory lock, which would
 	// serialise every write for a limit that exists to stop unbounded growth,
 	// not to be exact to the byte.
-	if err := s.checkQuota(tx, chunkList); err != nil {
+	if err := s.checkQuota(tx, space, name, chunkList); err != nil {
 		return false, 0, err
 	}
 

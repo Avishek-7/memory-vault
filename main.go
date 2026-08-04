@@ -452,7 +452,14 @@ func compactGroup(vault *store.Store, space string, g []store.MemoryCentroid, dr
 	if len(g) == 1 {
 		mergedSource, mergedKind = g[0].Source, g[0].Kind
 	}
-	if _, err := vault.SaveMemory(space, newName, merged, mergedSource, mergedKind); err != nil {
+	// Exempt from quota on purpose. compactGroup writes the merged memory
+	// BEFORE deleting the sources it replaces — the safe order, since losing
+	// the sources to a failed save would destroy data — which means usage
+	// transiently holds both. A tenant at their cap would therefore be unable
+	// to compact, and compaction is precisely what quotaResult tells them to
+	// do to get back under it. The overshoot is bounded by one summary and
+	// disappears on the next few lines when the sources are deleted.
+	if _, err := vault.WithLimits(store.Unlimited).SaveMemory(space, newName, merged, mergedSource, mergedKind); err != nil {
 		return "", err
 	}
 	for _, m := range g {
@@ -634,6 +641,9 @@ func callTool(vault *store.Store, name string, args map[string]interface{}) map[
 			}
 			for _, g := range groups {
 				line, err := compactGroup(vault, sp, g, dryRun)
+				if quotaErr := quotaResult(err); quotaErr != nil {
+					return quotaErr
+				}
 				if err != nil {
 					return internalErr("compact_memories merge", err)
 				}
