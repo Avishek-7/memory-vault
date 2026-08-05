@@ -5,6 +5,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -426,6 +427,15 @@ func Open(cfg Config) (*Store, error) {
 	}, nil
 }
 
+// migrationLockID is a cluster-wide advisory lock key that serialises
+// concurrent calls to migrate. Two callers racing to CREATE EXTENSION or
+// ALTER TABLE in the same database — common in tests where every test opens
+// its own Store — can collide in the Postgres system catalogue and produce a
+// spurious "duplicate key value violates unique constraint
+// pg_type_typname_nsp_index" error. Holding the lock for the duration of the
+// migration turns that race into a queue.
+const migrationLockID = 0x6d656d766175 // "memvau" as a fixed bigint
+
 // migrate applies the idempotent schema migration in a single transaction.
 //
 // app.tenant_id has to be bound first: on a second and later startup the
@@ -433,8 +443,23 @@ func Open(cfg Config) (*Store, error) {
 // otherwise fail on an unset setting. Wrapping the whole thing in one
 // transaction also means a migration that fails partway — during the
 // primary-key swap, say — leaves the schema untouched rather than halfway.
+//
+// A session-level advisory lock (acquired outside the transaction, released
+// on unlock or connection close) serialises concurrent migrations so that
+// CREATE EXTENSION IF NOT EXISTS vector does not race in the system catalogue.
 func migrate(db *sql.DB, dim int) error {
-	tx, err := db.Begin()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(context.Background(), `SELECT pg_advisory_lock($1)`, migrationLockID); err != nil {
+		return fmt.Errorf("acquiring migration lock: %w", err)
+	}
+	defer conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockID) //nolint:errcheck
+
+	tx, err := conn.BeginTx(context.Background(), nil)
 	if err != nil {
 		return err
 	}
