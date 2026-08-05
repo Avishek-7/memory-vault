@@ -29,6 +29,55 @@ the disk.
 - `TenantForKey` now returns the tenant's plan from the same join, so
   applying limits costs no extra query per request.
 
+Fixed in review of the above:
+
+- Storage quotas counted CHARACTERS, not bytes. Postgres `length()` counts
+  characters while Go's `len()` counts bytes, so every non-ASCII memory was
+  undercounted on read and charged at full size on write — a tenant storing
+  emoji or non-Latin script could exceed `MaxContentBytes`. Both queries now
+  use `octet_length`.
+- An unrecognised plan loaded `free`'s limits but derived its override prefix
+  from the raw name, so it looked for `PLAN_<TYPO>_*` and silently ignored the
+  `PLAN_FREE_*` values an operator had configured. New `store.CanonicalPlan`
+  is the single source of truth for that mapping.
+- `Retry-After` truncated fractional delays, so a 1.33s wait was advertised as
+  1s and a compliant client retried early into another 429. It now rounds up.
+- A non-overwrite write to a name that already exists is now detected
+  before the content is embedded. `saveMemory` embeds outside its
+  transaction on purpose, so a duplicate destined to be skipped was paying
+  for the whole embedding pipeline — an HTTP round-trip per chunk — first.
+  That is the common case rather than the rare one: `import_memories`
+  defaults to `overwrite: false` and a standby re-imports the same backup
+  on every sync.
+- A non-overwrite write to a name that already exists now short-circuits
+  before the quota check. It was already going to be skipped by the primary
+  key, but charging the incoming payload against the cap could reject an
+  import that would have changed nothing — and since `Import` aborts on the
+  first error, one oversized duplicate took the whole restore with it. The
+  unique violation remains authoritative for the concurrent case.
+- Quotas no longer double-charge a memory that already exists. Usage is
+  measured excluding the `(space, name)` being written, then charged once —
+  so re-importing a backup a tenant already holds is skipped as intended
+  rather than rejected, and an import no longer aborts on the first
+  duplicate. Overwriting a memory that consumes a tenant's whole quota
+  works too.
+- `compact_memories` now refuses a merge that comes back larger than the
+  sources it would replace, reporting the group as skipped with the sources
+  left intact. Nothing bounds a chat model's output length, so without this
+  the quota exemption below was a way around the cap: the merged memory is
+  written unlimited and the sources are then deleted, leaving a tenant
+  permanently over `MaxContentBytes`.
+- `compact_memories` is exempt from quota. It writes the merged memory
+  before deleting the sources it replaces (the safe order), so usage
+  transiently holds both — meaning a tenant at their cap could not compact,
+  which is exactly what they are told to do to get back under it. The
+  compaction path also reports quota errors readably instead of as a
+  generic internal error.
+- `ratelimit.New` clamps a positive `idleTTL` to at least a minute. Evicting a
+  bucket is equivalent to refilling it instantly, so a shorter TTL let an
+  exhausted tenant regain a full allowance early when any other tenant's
+  request triggered a sweep.
+
 **Multi-tenant backups, and a vector-search recall fix.** Both close gaps
 opened by the move to row-level security.
 

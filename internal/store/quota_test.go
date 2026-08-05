@@ -181,3 +181,258 @@ func TestQuotaCountsAcrossSpaces(t *testing.T) {
 		t.Fatalf("a third space escaped the cap (%v); quotas must count the whole tenant", err)
 	}
 }
+
+// TestQuotaMeasuresBytesNotCharacters guards a mismatch that silently let
+// tenants past their cap: Postgres length() counts CHARACTERS while Go's
+// len() counts BYTES, so every non-ASCII memory was undercounted on read and
+// charged at full size on write. A tenant storing emoji or non-Latin script
+// could exceed MaxContentBytes by the difference.
+func TestQuotaMeasuresBytesNotCharacters(t *testing.T) {
+	st := setupTenantDB(t)
+	makeTenant(t, st, tenantAID, "a@example.test")
+	tenant := st.ForTenant(tenantAID)
+	t.Cleanup(func() { tenant.DeleteMemory("utf8", "multibyte") })
+
+	// Every rune here is multibyte, so characters and bytes differ sharply.
+	content := strings.Repeat("é", 100) // 100 characters, 200 bytes
+	wantBytes := int64(len(content))
+	if wantBytes != 200 {
+		t.Fatalf("test fixture is wrong: %d bytes, want 200", wantBytes)
+	}
+	if _, err := tenant.SaveMemory("utf8", "multibyte", content, DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("SaveMemory: %v", err)
+	}
+
+	usage, err := tenant.Usage()
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if usage.ContentBytes != wantBytes {
+		t.Errorf("Usage.ContentBytes = %d for %d bytes of multibyte content — usage is being "+
+			"measured in characters, so a tenant can exceed its byte quota", usage.ContentBytes, wantBytes)
+	}
+}
+
+// TestByteQuotaCannotBeExceededWithMultibyteContent is the same bug seen from
+// the enforcement side rather than the reporting side.
+func TestByteQuotaCannotBeExceededWithMultibyteContent(t *testing.T) {
+	st := setupTenantDB(t)
+	makeTenant(t, st, tenantAID, "a@example.test")
+	// 300-byte cap. Two 200-byte writes must not both fit.
+	tenant := st.ForTenant(tenantAID).WithLimits(PlanLimits{MaxContentBytes: 300})
+	t.Cleanup(func() {
+		tenant.DeleteMemory("utf8-cap", "first")
+		tenant.DeleteMemory("utf8-cap", "second")
+	})
+
+	content := strings.Repeat("é", 100) // 200 bytes
+	if _, err := tenant.SaveMemory("utf8-cap", "first", content, DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("first 200-byte write under a 300-byte cap failed: %v", err)
+	}
+	_, err := tenant.SaveMemory("utf8-cap", "second", content, DefaultSource, DefaultKind)
+	var quota *QuotaError
+	if !errors.As(err, &quota) {
+		t.Fatalf("a second 200-byte write fit under a 300-byte cap (%v); usage must be "+
+			"counted in bytes, not characters", err)
+	}
+}
+
+func TestCanonicalPlan(t *testing.T) {
+	for _, plan := range []string{"free", "builder", "team"} {
+		if got := CanonicalPlan(plan); got != plan {
+			t.Errorf("CanonicalPlan(%q) = %q, want it unchanged", plan, got)
+		}
+	}
+	// Anything unrecognised must collapse to the same name its limits come
+	// from, so callers deriving config keys from it read real configuration.
+	for _, plan := range []string{"typo", "", "TEAM", "enterprise"} {
+		if got := CanonicalPlan(plan); got != FallbackPlan {
+			t.Errorf("CanonicalPlan(%q) = %q, want %q", plan, got, FallbackPlan)
+		}
+	}
+}
+
+// TestImportOfAnExistingMemoryIsNotDoubleCharged covers the non-overwrite
+// path, where the existing rows are NOT deleted before the quota check.
+// Counting them alongside the incoming copy charged the same memory twice,
+// which could fail an import of a backup the tenant already holds — and
+// Import returns on the first error, so that aborted the whole import
+// instead of skipping the duplicate.
+func TestImportOfAnExistingMemoryIsNotDoubleCharged(t *testing.T) {
+	st := setupTenantDB(t)
+	makeTenant(t, st, tenantAID, "a@example.test")
+	content := strings.Repeat("x", 100)
+	// Room for exactly one copy plus a little slack — enough that the memory
+	// fits, but not twice.
+	tenant := st.ForTenant(tenantAID).WithLimits(PlanLimits{MaxMemories: 1, MaxContentBytes: 150})
+	t.Cleanup(func() { tenant.DeleteMemory("imp", "existing") })
+
+	if _, err := tenant.SaveMemory("imp", "existing", content, DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+
+	// Re-importing the same memory without overwrite must skip it, not be
+	// rejected for exceeding a quota it already fits inside.
+	res, err := tenant.Import([]MemoryExport{{
+		Name: "existing", Space: "imp", Source: DefaultSource, Kind: DefaultKind, Content: content,
+	}}, "", "", false)
+	if err != nil {
+		t.Fatalf("re-importing an already-stored memory was rejected: %v", err)
+	}
+	if len(res.Skipped) != 1 {
+		t.Errorf("Import skipped %v, want the single duplicate skipped", res.Skipped)
+	}
+}
+
+// TestOverwriteAtTheByteCapStillWorks is the same exclusion seen from the
+// overwrite side: a tenant whose storage is entirely consumed by one memory
+// must still be able to replace it with content of a similar size.
+func TestOverwriteAtTheByteCapStillWorks(t *testing.T) {
+	st := setupTenantDB(t)
+	makeTenant(t, st, tenantAID, "a@example.test")
+	tenant := st.ForTenant(tenantAID).WithLimits(PlanLimits{MaxContentBytes: 120})
+	t.Cleanup(func() { tenant.DeleteMemory("ow-cap", "only") })
+
+	if _, err := tenant.SaveMemory("ow-cap", "only", strings.Repeat("a", 100), DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+	if _, err := tenant.SaveMemory("ow-cap", "only", strings.Repeat("b", 100), DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("replacing a memory that consumes the whole quota was rejected: %v", err)
+	}
+	usage, err := tenant.Usage()
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if usage.ContentBytes != 100 {
+		t.Errorf("after overwrite usage = %d bytes, want 100 — the replaced copy is still counted", usage.ContentBytes)
+	}
+}
+
+func TestFallbackPlanExists(t *testing.T) {
+	// init() panics if this is violated, so reaching the test at all proves
+	// it; asserting explicitly documents why the init exists.
+	if _, ok := DefaultPlanLimits[FallbackPlan]; !ok {
+		t.Fatalf("FallbackPlan %q missing from DefaultPlanLimits", FallbackPlan)
+	}
+	if LimitsForPlan("nonexistent-plan") == Unlimited {
+		t.Error("an unrecognised plan resolved to unlimited; the fallback must be the strictest plan")
+	}
+}
+
+// TestImportOfALargerDuplicateIsSkippedNotRejected covers the gap my first
+// fix left: excluding the existing copy from usage still charged the INCOMING
+// payload, so importing a duplicate larger than the stored copy could trip
+// MaxContentBytes for a write that will never happen. Import aborts on the
+// first error, so one oversized duplicate took the whole restore down.
+func TestImportOfALargerDuplicateIsSkippedNotRejected(t *testing.T) {
+	st := setupTenantDB(t)
+	makeTenant(t, st, tenantAID, "a@example.test")
+	tenant := st.ForTenant(tenantAID).WithLimits(PlanLimits{MaxContentBytes: 300})
+	t.Cleanup(func() {
+		tenant.DeleteMemory("imp-big", "existing")
+		tenant.DeleteMemory("imp-big", "fresh")
+	})
+
+	if _, err := tenant.SaveMemory("imp-big", "existing", strings.Repeat("a", 100), DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+
+	// The incoming copy is far bigger than the cap allows on top of what is
+	// stored — but it will be skipped, so it must not be charged at all.
+	// A second, genuinely new memory follows it to prove the import as a
+	// whole survives rather than aborting on the duplicate.
+	res, err := tenant.Import([]MemoryExport{
+		{Name: "existing", Space: "imp-big", Content: strings.Repeat("b", 5000)},
+		{Name: "fresh", Space: "imp-big", Content: strings.Repeat("c", 100)},
+	}, "", "", false)
+	if err != nil {
+		t.Fatalf("import containing an oversized duplicate was rejected: %v", err)
+	}
+	if len(res.Skipped) != 1 || len(res.Imported) != 1 {
+		t.Errorf("Import imported=%v skipped=%v, want the duplicate skipped and the new one imported",
+			res.Imported, res.Skipped)
+	}
+	// And the stored copy must be untouched by the skipped write.
+	if got, _ := tenant.Reassemble("imp-big", "existing"); got != strings.Repeat("a", 100) {
+		t.Errorf("the skipped duplicate modified the stored memory (len %d)", len(got))
+	}
+}
+
+// countingEmbedder records how many times it was asked to embed, and can be
+// made to fail — the two ways to prove embedding did not happen.
+type countingEmbedder struct {
+	calls int
+	err   error
+}
+
+func (c *countingEmbedder) Embed(string) ([]float32, error) {
+	c.calls++
+	if c.err != nil {
+		return nil, c.err
+	}
+	return make([]float32, DefaultEmbedDim), nil
+}
+
+// TestDuplicateSkipCostsNoEmbedding covers the wasted work in the skip path.
+// saveMemory embeds BEFORE opening its transaction (deliberately, so the
+// expectSource row lock is not held across HTTP round-trips), so a duplicate
+// that is going to be skipped was paying for the whole embedding pipeline
+// first. import_memories defaults to overwrite=false and a standby re-imports
+// the same backup on every sync, so discarding that work is the common case.
+func TestDuplicateSkipCostsNoEmbedding(t *testing.T) {
+	st := setupTenantDB(t)
+	makeTenant(t, st, tenantAID, "a@example.test")
+	tenant := st.ForTenant(tenantAID)
+	t.Cleanup(func() { tenant.DeleteMemory("dup-embed", "existing") })
+
+	if _, err := tenant.SaveMemory("dup-embed", "existing", "some content", DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+
+	counter := &countingEmbedder{}
+	tenant.Embedder = counter
+	res, err := tenant.Import([]MemoryExport{
+		{Name: "existing", Space: "dup-embed", Content: "some content"},
+	}, "", "", false)
+	if err != nil {
+		t.Fatalf("importing a duplicate: %v", err)
+	}
+	if len(res.Skipped) != 1 {
+		t.Fatalf("Import skipped %v, want the duplicate skipped", res.Skipped)
+	}
+	if counter.calls != 0 {
+		t.Errorf("embedding was called %d time(s) for a memory that was skipped; the duplicate "+
+			"check must run before the embedding pipeline", counter.calls)
+	}
+}
+
+// TestDuplicateSkipSurvivesABrokenEmbedder is the same property proven the
+// other way round: if the skip path still reached the embedder, a failing one
+// would surface as an error instead of a clean skip.
+func TestDuplicateSkipSurvivesABrokenEmbedder(t *testing.T) {
+	st := setupTenantDB(t)
+	makeTenant(t, st, tenantAID, "a@example.test")
+	tenant := st.ForTenant(tenantAID)
+	t.Cleanup(func() { tenant.DeleteMemory("dup-broken", "existing") })
+
+	if _, err := tenant.SaveMemory("dup-broken", "existing", "some content", DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+
+	tenant.Embedder = &countingEmbedder{err: errors.New("embedding backend is down")}
+	res, err := tenant.Import([]MemoryExport{
+		{Name: "existing", Space: "dup-broken", Content: "some content"},
+	}, "", "", false)
+	if err != nil {
+		t.Fatalf("a duplicate should be skipped without consulting the embedder, got: %v", err)
+	}
+	if len(res.Skipped) != 1 {
+		t.Errorf("Import skipped %v, want the duplicate skipped", res.Skipped)
+	}
+
+	// And a genuinely new memory must still fail loudly on a broken embedder,
+	// or this "fix" would be silently swallowing real errors.
+	if _, _, err := tenant.saveMemory("dup-broken", "brand-new", "content", DefaultSource, DefaultKind, false, ""); err == nil {
+		t.Error("a new memory was written despite the embedder failing")
+	}
+}

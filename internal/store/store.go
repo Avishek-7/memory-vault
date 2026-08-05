@@ -699,6 +699,25 @@ func (s *Store) SaveMemoryExpectSource(space, name, content, source, kind, expec
 	return chunks, err
 }
 
+// memoryExists reports whether (space, name) already holds a memory for the
+// bound tenant. RLS scopes it, so it cannot see another tenant's rows and
+// wrongly report a collision.
+func (s *Store) memoryExists(space, name string) (bool, error) {
+	rows, err := s.db.Query(
+		`SELECT EXISTS (SELECT 1 FROM memories WHERE space = $1 AND name = $2)`, space, name)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var exists bool
+	if rows.Next() {
+		if err := rows.Scan(&exists); err != nil {
+			return false, err
+		}
+	}
+	return exists, rows.Err()
+}
+
 // isUniqueViolation reports whether err is a Postgres unique-constraint
 // violation (SQLSTATE 23505) — here, a concurrent write to the same
 // (space, name, chunk_index) primary key.
@@ -722,6 +741,25 @@ func isUniqueViolation(err error) bool {
 // write happens; a mismatch returns a *SourceConflictError and writes
 // nothing.
 func (s *Store) saveMemory(space, name, content, source, kind string, overwrite bool, expectSource string) (wrote bool, chunks int, err error) {
+	// A non-overwrite write to a name that already exists is going to be
+	// skipped, so find that out BEFORE embedding rather than after. Embedding
+	// is an HTTP round-trip per chunk, and discarding it is the common case
+	// rather than the rare one: import_memories defaults to overwrite=false,
+	// and a standby re-imports the same backup on every sync.
+	//
+	// Advisory only. The in-transaction check and the insert's own unique
+	// violation stay authoritative for a writer that inserts between this
+	// lookup and the write.
+	if !overwrite {
+		exists, err := s.memoryExists(space, name)
+		if err != nil {
+			return false, 0, err
+		}
+		if exists {
+			return false, 0, nil
+		}
+	}
+
 	// Embed before opening the transaction: each Embed call is an HTTP
 	// round-trip to Ollama/OpenAI, and doing this inside the tx would hold
 	// the expectSource row lock (below) for the whole embedding pipeline
@@ -762,16 +800,39 @@ func (s *Store) saveMemory(space, name, content, source, kind string, overwrite 
 			return false, 0, err
 		}
 	}
+	// A non-overwrite write to a name that already exists is a no-op: the
+	// insert below would hit the primary key and be skipped. Detect that
+	// before the quota check, because charging the incoming payload against
+	// the tenant's cap for a write that will never happen can fail an import
+	// that would have changed nothing — and Import aborts on the first error,
+	// so one oversized duplicate takes the whole restore down with it.
+	//
+	// This is an optimisation, not the guard: the unique violation below
+	// remains authoritative for a concurrent writer that inserts between this
+	// check and ours.
+	if !overwrite {
+		var exists bool
+		if err := tx.QueryRow(
+			`SELECT EXISTS (SELECT 1 FROM memories WHERE space = $1 AND name = $2)`, space, name,
+		).Scan(&exists); err != nil {
+			return false, 0, err
+		}
+		if exists {
+			return false, 0, nil
+		}
+	}
+
 	// Quota is checked here, inside the transaction and after any overwrite
-	// delete above, so replacing an existing memory is measured against the
-	// space it actually frees rather than counted twice.
+	// delete above. It excludes this (space, name) from current usage and
+	// charges it once, so replacing an existing memory — by overwrite, or by
+	// an import that will skip it — is never counted twice.
 	//
 	// ponytail: two concurrent writes can both pass this check and land, so a
 	// tenant can overshoot its cap by roughly one in-flight write per
 	// connection. Closing that needs a per-tenant advisory lock, which would
 	// serialise every write for a limit that exists to stop unbounded growth,
 	// not to be exact to the byte.
-	if err := s.checkQuota(tx, chunkList); err != nil {
+	if err := s.checkQuota(tx, space, name, chunkList); err != nil {
 		return false, 0, err
 	}
 

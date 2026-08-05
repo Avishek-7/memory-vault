@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"memory-vault/internal/store"
 )
@@ -315,5 +316,121 @@ func TestQuotaResult(t *testing.T) {
 	wrapped := fmt.Errorf("saving: %w", &store.QuotaError{Resource: "memories", Limit: 5, Current: 5, Adding: 1})
 	if quotaResult(wrapped) == nil {
 		t.Error("quotaResult missed a wrapped *store.QuotaError; errors.As should see through the wrapping")
+	}
+}
+
+// TestPlanLimitsOverridesUseTheCanonicalPlan covers a mismatch that made
+// operator configuration silently ineffective: an unrecognised plan loaded
+// free's limits but derived its override prefix from the raw name, so it
+// looked for PLAN_<TYPO>_* and ignored the PLAN_FREE_* values actually set.
+func TestPlanLimitsOverridesUseTheCanonicalPlan(t *testing.T) {
+	t.Setenv("PLAN_FREE_RPM", "7")
+	t.Setenv("PLAN_FREE_MAX_MEMORIES", "11")
+
+	known := planLimits("free")
+	if known.RequestsPerMinute != 7 || known.MaxMemories != 11 {
+		t.Fatalf("planLimits(\"free\") = %+v, want the configured overrides applied", known)
+	}
+
+	// An unrecognised plan falls back to free's limits, so it must also pick
+	// up free's overrides rather than looking for PLAN_TYPO_*.
+	unknown := planLimits("not-a-real-plan")
+	if unknown != known {
+		t.Errorf("planLimits(unknown) = %+v, want the same as free %+v — the override prefix "+
+			"is being derived from the unrecognised name", unknown, known)
+	}
+}
+
+func TestRetryAfterSecondsRoundsUp(t *testing.T) {
+	cases := []struct {
+		in   time.Duration
+		want int
+	}{
+		{0, 1},                         // never advertise an immediate retry
+		{-time.Second, 1},              // nor a negative one
+		{100 * time.Millisecond, 1},    // sub-second still waits a second
+		{time.Second, 1},               // exact
+		{1330 * time.Millisecond, 2},   // the bug: truncation said 1, client retries early
+		{11500 * time.Millisecond, 12}, // rounds up, not to nearest
+	}
+	for _, c := range cases {
+		if got := retryAfterSeconds(c.in); got != c.want {
+			t.Errorf("retryAfterSeconds(%v) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+// fixedEmbedder is a stand-in for Ollama so compaction can be exercised
+// without a model server; the vectors it returns are never compared.
+type fixedEmbedder struct{}
+
+func (fixedEmbedder) Embed(string) ([]float32, error) {
+	return make([]float32, store.DefaultEmbedDim), nil
+}
+
+// TestCompactionRefusesToGrowStorage covers the hole the quota exemption
+// would otherwise open. compactGroup writes the merged memory with limits
+// disabled — necessary, because a tenant at their cap must still be able to
+// compact — and then deletes the sources. A chat model that returns MORE than
+// it was given would therefore leave the tenant permanently over quota, and
+// nothing bounds a model's output length.
+func TestCompactionRefusesToGrowStorage(t *testing.T) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("DATABASE_URL not set")
+	}
+	vault, err := store.Open(store.Config{DatabaseURL: url, Embedder: fixedEmbedder{}})
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer vault.Close()
+
+	const space = "compact-growth"
+	sources := []string{"alpha content here", "beta content here"}
+	sourceBytes := 0
+	for i, c := range sources {
+		name := fmt.Sprintf("src-%d", i)
+		if _, err := vault.SaveMemory(space, name, c, store.DefaultSource, store.DefaultKind); err != nil {
+			t.Fatalf("SaveMemory: %v", err)
+		}
+		sourceBytes += len(c)
+		defer vault.DeleteMemory(space, name)
+	}
+
+	centroids, err := vault.MemoryCentroids(space)
+	if err != nil {
+		t.Fatalf("MemoryCentroids: %v", err)
+	}
+	if len(centroids) != len(sources) {
+		t.Fatalf("got %d centroids, want %d", len(centroids), len(sources))
+	}
+
+	original := ollamaChat
+	defer func() { ollamaChat = original }()
+	// A model that rambles: far more output than it was given.
+	ollamaChat = func(string) (string, error) {
+		return strings.Repeat("bloat ", sourceBytes), nil
+	}
+
+	line, err := compactGroup(vault, space, centroids, false)
+	if err != nil {
+		t.Fatalf("compactGroup: %v", err)
+	}
+	if !strings.Contains(line, "skipped") {
+		t.Errorf("compactGroup reported %q, want the group skipped for growing storage", line)
+	}
+	defer vault.DeleteMemory(space, compactTargetName([]string{centroids[0].Name, centroids[1].Name}))
+
+	// The sources must survive: nothing was written, so nothing may be lost.
+	for i := range sources {
+		name := fmt.Sprintf("src-%d", i)
+		if got, _ := vault.Reassemble(space, name); got == "" {
+			t.Errorf("source %s was deleted even though the merge was skipped", name)
+		}
+	}
+	// And the oversized merge must not be stored.
+	merged := compactTargetName([]string{centroids[0].Name, centroids[1].Name})
+	if got, _ := vault.Reassemble(space, merged); got != "" {
+		t.Errorf("the oversized merge was written anyway (%d bytes)", len(got))
 	}
 }

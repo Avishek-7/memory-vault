@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -154,7 +155,9 @@ func argSpace(args map[string]interface{}) string {
 // ollamaChat sends a single-turn prompt to the local Ollama chat model and
 // returns its response text. Used by compact_memories and
 // get_session_summary, never search/save.
-func ollamaChat(prompt string) (string, error) {
+// ollamaChat is a var, not a func, purely so tests can substitute a model
+// response without a live Ollama.
+var ollamaChat = func(prompt string) (string, error) {
 	return chat.Chat(ollamaURL(), ollamaChatModel(), prompt)
 }
 
@@ -426,11 +429,13 @@ func compactGroup(vault *store.Store, space string, g []store.MemoryCentroid, dr
 	}
 
 	var parts []string
+	sourceBytes := 0
 	for _, m := range g {
 		content, err := vault.Reassemble(space, m.Name)
 		if err != nil {
 			return "", err
 		}
+		sourceBytes += len(content)
 		parts = append(parts, fmt.Sprintf("--- %s ---\n%s", m.Name, content))
 	}
 	prompt := fmt.Sprintf("The following are related notes. Merge them into a single consolidated note that preserves every distinct fact and drops redundancy. Respond with only the merged note text, no preamble.\n\n%s", strings.Join(parts, "\n\n"))
@@ -451,7 +456,28 @@ func compactGroup(vault *store.Store, space string, g []store.MemoryCentroid, dr
 	if len(g) == 1 {
 		mergedSource, mergedKind = g[0].Source, g[0].Kind
 	}
-	if _, err := vault.SaveMemory(space, newName, merged, mergedSource, mergedKind); err != nil {
+	// Compaction must actually shrink storage, or the quota exemption below
+	// becomes a way around the cap: the merged memory is written without a
+	// limit and the sources are then deleted, so a model that returns MORE
+	// than it was given would leave the tenant permanently over quota. There
+	// is nothing bounding a chat model's output length, so this is checked
+	// rather than assumed. Skipping the group is right: the sources are still
+	// intact, and nothing has been written.
+	if len(merged) > sourceBytes {
+		log.Printf("compact_memories: space=%q sources=%v produced %d bytes from %d bytes of sources, skipping",
+			space, names, len(merged), sourceBytes)
+		return fmt.Sprintf("space %q: [%s] -> skipped (the merge came back larger than the %d bytes it would replace)",
+			space, strings.Join(names, ", "), sourceBytes), nil
+	}
+
+	// Exempt from quota on purpose. compactGroup writes the merged memory
+	// BEFORE deleting the sources it replaces — the safe order, since losing
+	// the sources to a failed save would destroy data — which means usage
+	// transiently holds both. A tenant at their cap would therefore be unable
+	// to compact, and compaction is precisely what quotaResult tells them to
+	// do to get back under it. The overshoot is bounded by one summary and
+	// disappears on the next few lines when the sources are deleted.
+	if _, err := vault.WithLimits(store.Unlimited).SaveMemory(space, newName, merged, mergedSource, mergedKind); err != nil {
 		return "", err
 	}
 	for _, m := range g {
@@ -633,6 +659,9 @@ func callTool(vault *store.Store, name string, args map[string]interface{}) map[
 			}
 			for _, g := range groups {
 				line, err := compactGroup(vault, sp, g, dryRun)
+				if quotaErr := quotaResult(err); quotaErr != nil {
+					return quotaErr
+				}
 				if err != nil {
 					return internalErr("compact_memories merge", err)
 				}
@@ -861,6 +890,11 @@ var tenantLimiter = ratelimit.New(time.Hour)
 // operator can change the economics without a code change. Setting any of
 // them to 0 removes that limit for the plan.
 func planLimits(plan string) store.PlanLimits {
+	// Both the limits and the override prefix have to come from the SAME
+	// name. Deriving the prefix from the raw value meant an unrecognised plan
+	// loaded free's defaults but then looked for PLAN_<TYPO>_* overrides,
+	// silently ignoring the PLAN_FREE_* limits the operator had configured.
+	plan = store.CanonicalPlan(plan)
 	l := store.LimitsForPlan(plan)
 	prefix := "PLAN_" + strings.ToUpper(plan) + "_"
 	l.RequestsPerMinute = envOrInt(prefix+"RPM", l.RequestsPerMinute)
@@ -868,6 +902,19 @@ func planLimits(plan string) store.PlanLimits {
 	l.MaxMemories = envOrInt(prefix+"MAX_MEMORIES", l.MaxMemories)
 	l.MaxContentBytes = int64(envOrInt(prefix+"MAX_MB", int(l.MaxContentBytes>>20))) << 20
 	return l
+}
+
+// retryAfterSeconds converts a refill delay into the whole seconds a
+// Retry-After header carries. It rounds UP: truncating 1.3s to 1 tells a
+// compliant client to retry before a token exists, which just earns it
+// another 429. Never returns less than 1, since Retry-After: 0 invites an
+// immediate retry.
+func retryAfterSeconds(d time.Duration) int {
+	seconds := int(math.Ceil(d.Seconds()))
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }
 
 // matchesAuthToken reports whether token is one of the AUTH_TOKEN values.
@@ -1008,11 +1055,7 @@ func mcpHandler(w http.ResponseWriter, r *http.Request) {
 		tenant := vault.TenantID()
 		if !tenantLimiter.Allow(tenant, limits.RequestsPerMinute, limits.Burst) {
 			retry := tenantLimiter.RetryAfter(tenant, limits.RequestsPerMinute)
-			seconds := int(retry.Seconds())
-			if seconds < 1 {
-				seconds = 1
-			}
-			w.Header().Set("Retry-After", strconv.Itoa(seconds))
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(retry)))
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
