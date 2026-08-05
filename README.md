@@ -232,12 +232,20 @@ memories.
 
 ```
 go build -o memory-vault-tui ./cmd/memory-vault-tui
-DATABASE_URL="postgres://user:pass@localhost:5432/memory_vault?sslmode=disable" \
+DATABASE_URL="postgres://memory_vault_app:pass@localhost:5432/memory_vault?sslmode=disable" \
 OLLAMA_URL="http://localhost:11434" \
 ./memory-vault-tui
 ```
 
 (or `go run ./cmd/memory-vault-tui` without building a binary first.)
+
+`DATABASE_URL` must name `memory_vault_app`, not the superuser: the TUI
+opens the store through the same `internal/store` code the server does, so
+it refuses to start against a superuser or `BYPASSRLS` role, for the reason
+in "Database roles and tenant isolation" below. It has no API key and no
+tenant flag — it always connects as the bootstrap tenant, and RLS confines
+it to that tenant's memories. It is a local admin tool for the vault the
+server was started on, not a way to browse other tenants.
 
 | Key | Action |
 |---|---|
