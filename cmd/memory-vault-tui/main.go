@@ -41,11 +41,11 @@ func envOrInt(key string, fallback int) int {
 // reads/writes memories with whichever embedding backend the MCP server
 // is configured to use. Any value other than "ollama"/"openai" is a
 // configuration error, not a silent fallback to Ollama.
-func embedderFromEnv() (embed.Embedder, error) {
+func embedderFromEnv(ollamaURL string) (embed.Embedder, error) {
 	switch provider := envOr("EMBED_PROVIDER", "ollama"); provider {
 	case "ollama":
 		return &embed.OllamaEmbedder{
-			URL:   envOr("OLLAMA_URL", "http://localhost:11434"),
+			URL:   ollamaURL,
 			Model: envOr("OLLAMA_EMBED_MODEL", "all-minilm"),
 		}, nil
 	case "openai":
@@ -59,13 +59,13 @@ func embedderFromEnv() (embed.Embedder, error) {
 	}
 }
 
-func storeConfig() (store.Config, error) {
-	embedder, err := embedderFromEnv()
+func storeConfig(databaseURL, ollamaURL string) (store.Config, error) {
+	embedder, err := embedderFromEnv(ollamaURL)
 	if err != nil {
 		return store.Config{}, err
 	}
 	return store.Config{
-		DatabaseURL:     os.Getenv("DATABASE_URL"),
+		DatabaseURL:     databaseURL,
 		Embedder:        embedder,
 		EmbedDim:        envOrInt("EMBED_DIM", store.DefaultEmbedDim),
 		MaxOpenConns:    5,
@@ -163,7 +163,8 @@ const (
 )
 
 type model struct {
-	st *store.Store
+	st        *store.Store
+	ollamaURL string
 
 	rows         []row
 	cursor       int
@@ -187,10 +188,10 @@ type model struct {
 	ready         bool
 }
 
-func initialModel(st *store.Store) model {
+func initialModel(st *store.Store, ollamaURL string) model {
 	ti := textinput.New()
 	ti.Prompt = "> "
-	return model{st: st, currentSpace: store.DefaultSpace, input: ti}
+	return model{st: st, ollamaURL: ollamaURL, currentSpace: store.DefaultSpace, input: ti}
 }
 
 func (m model) Init() tea.Cmd {
@@ -228,7 +229,7 @@ func deleteCmd(st *store.Store, space, name string) tea.Cmd {
 // sessionSummaryCmd builds get_session_summary's resume prompt from a
 // space's most-recently-updated memories and sends it through ollamaChat.
 // Read-only — writes nothing.
-func sessionSummaryCmd(st *store.Store, space string) tea.Cmd {
+func sessionSummaryCmd(st *store.Store, space, ollamaURL string) tea.Cmd {
 	return func() tea.Msg {
 		recents, err := st.RecentMemories(space, 15)
 		if err != nil {
@@ -238,7 +239,7 @@ func sessionSummaryCmd(st *store.Store, space string) tea.Cmd {
 			return sessionSummaryDoneMsg{content: fmt.Sprintf("(no memories yet in space %q)", space)}
 		}
 		prompt := chat.SessionSummaryPrompt(space, recents)
-		summary, err := chat.Chat(envOr("OLLAMA_URL", "http://localhost:11434"), ollamaChatModel(), prompt)
+		summary, err := chat.Chat(ollamaURL, ollamaChatModel(), prompt)
 		if err != nil {
 			return sessionSummaryDoneMsg{err: err}
 		}
@@ -542,7 +543,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "s":
 			m.status = fmt.Sprintf("generating session summary for space %q...", m.currentSpace)
 			m.statusErr = false
-			return m, sessionSummaryCmd(m.st, m.currentSpace)
+			return m, sessionSummaryCmd(m.st, m.currentSpace, m.ollamaURL)
 		}
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
@@ -616,7 +617,32 @@ func (m model) View() string {
 }
 
 func main() {
-	cfg, err := storeConfig()
+	args := os.Args[1:]
+
+	if len(args) > 0 && args[0] == "config" {
+		if err := runConfigCommand(args[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	profileOverride := ""
+	if len(args) > 0 && args[0] == "--profile" {
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "error: --profile requires a profile name")
+			os.Exit(1)
+		}
+		profileOverride = args[1]
+	}
+
+	profile, err := resolveActiveProfile(profileOverride)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config error:", err)
+		os.Exit(1)
+	}
+
+	cfg, err := storeConfig(profile.DatabaseURL, profile.OllamaURL)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "config error:", err)
 		os.Exit(1)
@@ -628,7 +654,7 @@ func main() {
 	}
 	defer st.Close()
 
-	p := tea.NewProgram(initialModel(st), tea.WithAltScreen())
+	p := tea.NewProgram(initialModel(st, profile.OllamaURL), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "tui:", err)
 		os.Exit(1)

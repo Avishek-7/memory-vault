@@ -232,20 +232,39 @@ memories.
 
 ```
 go build -o memory-vault-tui ./cmd/memory-vault-tui
-DATABASE_URL="postgres://memory_vault_app:pass@localhost:5432/memory_vault?sslmode=disable" \
-OLLAMA_URL="http://localhost:11434" \
 ./memory-vault-tui
 ```
 
 (or `go run ./cmd/memory-vault-tui` without building a binary first.)
 
-`DATABASE_URL` must name `memory_vault_app`, not the superuser: the TUI
+The connection URL must name `memory_vault_app`, not the superuser: the TUI
 opens the store through the same `internal/store` code the server does, so
 it refuses to start against a superuser or `BYPASSRLS` role, for the reason
 in "Database roles and tenant isolation" below. It has no API key and no
 tenant flag — it always connects as the bootstrap tenant, and RLS confines
 it to that tenant's memories. It is a local admin tool for the vault the
 server was started on, not a way to browse other tenants.
+
+**Connection profiles.** The first run with no saved config prompts for a
+profile name and a `postgres://` URL, tests the connection before saving
+anything, and writes it to `~/.config/memory-vault/config.toml` (actually
+`os.UserConfigDir()`, which is `~/Library/Application Support/memory-vault`
+on macOS) at mode `0600`. Every run after that connects straight through,
+same as the old `DATABASE_URL`-per-run flow but without having to set it
+every time.
+
+```
+memory-vault-tui config add          # add another named profile
+memory-vault-tui config list         # show all profiles, * marks active, password redacted
+memory-vault-tui config use <name>   # switch which profile `memory-vault-tui` connects to
+memory-vault-tui config remove <name> [--force]
+memory-vault-tui --profile <name>    # use <name> for this run only, without changing active
+```
+
+This is for one person's own machines — there's no encryption beyond the
+file permissions, and no config sharing between them. `DATABASE_URL`, if
+set, still overrides the config entirely (the old flow keeps working
+unchanged, e.g. for CI or one-off scripts).
 
 | Key | Action |
 |---|---|
