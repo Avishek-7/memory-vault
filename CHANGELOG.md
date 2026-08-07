@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**memory-vault-tui: connection profiles.** First run with no saved config
+prompts for a `postgres://` URL, tests it before saving, and writes it to
+`~/.config/memory-vault/config.toml` (`os.UserConfigDir()`) at `0600`. Every
+run after that connects without needing `DATABASE_URL` set — which still
+works as an override, for scripts and CI that already relied on it.
+`memory-vault-tui config add/list/use/remove` manage multiple named
+profiles, and `--profile <name>` picks one for a single run without
+changing which one is active. Personal-machine scope only: no encryption
+beyond file permissions, no config sharing across machines.
+
 **Step 3 of multi-tenancy — rate limits and quotas.** Each tenant's plan now
 caps what it can consume, so one tenant cannot monopolise the server or fill
 the disk.
