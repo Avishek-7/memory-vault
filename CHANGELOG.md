@@ -4,7 +4,8 @@
 
 **memory-vault-tui: connection profiles.** First run with no saved config
 prompts for a `postgres://` URL, tests it before saving, and writes it to
-`~/.config/memory-vault/config.toml` (`os.UserConfigDir()`) at `0600`. Every
+`os.UserConfigDir()/memory-vault/config.toml` (`~/.config` on Linux,
+`~/Library/Application Support` on macOS) at `0600`. Every
 run after that connects without needing `DATABASE_URL` set — which still
 works as an override, for scripts and CI that already relied on it.
 `memory-vault-tui config add/list/use/remove` manage multiple named

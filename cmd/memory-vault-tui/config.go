@@ -10,6 +10,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -128,7 +129,11 @@ func quoteTOMLString(s string) string {
 	return `"` + s + `"`
 }
 
-// writeConfig always writes 0600: the file holds Postgres credentials.
+// writeConfig always ends with the file at 0600: the file holds Postgres
+// credentials. The WriteFile mode argument only takes effect when it
+// creates the file — on an existing file (e.g. left at 0644 by an older
+// version, or a looser umask) it's ignored and the old mode sticks, so the
+// mode is set explicitly afterward rather than trusted to WriteFile alone.
 func writeConfig(path string, cfg *tuiConfig) error {
 	var b strings.Builder
 	b.WriteString("active = " + quoteTOMLString(cfg.Active) + "\n")
@@ -145,7 +150,10 @@ func writeConfig(path string, cfg *tuiConfig) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(b.String()), 0600)
+	if err := os.WriteFile(path, []byte(b.String()), 0600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
 }
 
 // validateDatabaseURLShape rejects obviously-wrong input before it ever
@@ -184,11 +192,13 @@ func testConnection(databaseURL string) error {
 	return st.Close()
 }
 
-// redactDatabaseURL masks a password for display without touching anything
-// else in the URL. It works on the raw string rather than round-tripping
-// through net/url, because URL.String() percent-encodes characters like
-// "*" in userinfo — which would print a mangled mask instead of "***".
-func redactDatabaseURL(raw string) string {
+// redactURLPassword masks a password for display without touching anything
+// else in the URL — used for both the Postgres and Ollama URLs a profile
+// holds, since Ollama also accepts Basic Auth in its URL. It works on the
+// raw string rather than round-tripping through net/url, because
+// URL.String() percent-encodes characters like "*" in userinfo — which
+// would print a mangled mask instead of "***".
+func redactURLPassword(raw string) string {
 	schemeEnd := strings.Index(raw, "://")
 	if schemeEnd < 0 {
 		return raw
@@ -265,8 +275,11 @@ func promptWizard(reader *bufio.Reader, defaultName string) (name string, profil
 		// Ollama being unreachable right now doesn't block saving the
 		// profile — same reasoning as /healthz not checking it: embeddings
 		// failing is a lesser, separate concern from the vault itself being
-		// unreachable, and Ollama may simply not be running yet.
-		fmt.Printf("warning: could not reach Ollama at %s (%v) — saving anyway.\n", profile.OllamaURL, err)
+		// unreachable, and Ollama may simply not be running yet. The
+		// underlying error is not printed: an http.Client connection error
+		// embeds the request URL verbatim, which would leak a Basic Auth
+		// credential the same way printing the raw URL would.
+		fmt.Printf("warning: could not reach Ollama at %s — saving anyway.\n", redactURLPassword(profile.OllamaURL))
 	}
 
 	return name, profile, nil
@@ -274,8 +287,12 @@ func promptWizard(reader *bufio.Reader, defaultName string) (name string, profil
 
 // pingOllama does a quick reachability check, nothing more.
 func pingOllama(ollamaURL string) error {
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, strings.TrimSuffix(ollamaURL, "/")+"/api/tags", nil)
+	if err != nil {
+		return err
+	}
 	client := http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get(strings.TrimSuffix(ollamaURL, "/") + "/api/tags")
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -436,7 +453,7 @@ func configList(path string) error {
 		if ollamaURL == "" {
 			ollamaURL = defaultOllamaURL
 		}
-		fmt.Printf("%s %-*s  %s  (ollama: %s)\n", marker, width, name, redactDatabaseURL(cfg.Profiles[name].DatabaseURL), ollamaURL)
+		fmt.Printf("%s %-*s  %s  (ollama: %s)\n", marker, width, name, redactURLPassword(cfg.Profiles[name].DatabaseURL), redactURLPassword(ollamaURL))
 	}
 	return nil
 }

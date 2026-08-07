@@ -253,7 +253,7 @@ on macOS) at mode `0600`. Every run after that connects straight through,
 same as the old `DATABASE_URL`-per-run flow but without having to set it
 every time.
 
-```
+```text
 memory-vault-tui config add          # add another named profile
 memory-vault-tui config list         # show all profiles, * marks active, password redacted
 memory-vault-tui config use <name>   # switch which profile `memory-vault-tui` connects to

@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func TestValidateDatabaseURLShape(t *testing.T) {
 	cases := []struct {
@@ -25,17 +28,23 @@ func TestValidateDatabaseURLShape(t *testing.T) {
 	}
 }
 
-func TestRedactDatabaseURL(t *testing.T) {
-	got := redactDatabaseURL("postgres://user:secret@host:5432/db")
+func TestRedactURLPassword(t *testing.T) {
+	got := redactURLPassword("postgres://user:secret@host:5432/db")
 	want := "postgres://user:***@host:5432/db"
 	if got != want {
-		t.Errorf("redactDatabaseURL: got %q, want %q", got, want)
+		t.Errorf("redactURLPassword: got %q, want %q", got, want)
 	}
 	// No password: nothing to redact, string passes through unchanged.
-	got = redactDatabaseURL("postgres://user@host:5432/db")
+	got = redactURLPassword("postgres://user@host:5432/db")
 	want = "postgres://user@host:5432/db"
 	if got != want {
-		t.Errorf("redactDatabaseURL (no password): got %q, want %q", got, want)
+		t.Errorf("redactURLPassword (no password): got %q, want %q", got, want)
+	}
+	// Ollama also accepts Basic Auth in its URL — same redaction applies.
+	got = redactURLPassword("http://user:secret@192.168.1.44:11434")
+	want = "http://user:***@192.168.1.44:11434"
+	if got != want {
+		t.Errorf("redactURLPassword (ollama URL): got %q, want %q", got, want)
 	}
 }
 
@@ -73,5 +82,30 @@ func TestConfigRoundTrip(t *testing.T) {
 		if gotProfile.OllamaURL != want.OllamaURL {
 			t.Errorf("profile %q OllamaURL = %q, want %q", name, gotProfile.OllamaURL, want.OllamaURL)
 		}
+	}
+}
+
+// TestWriteConfigFixesLoosePermissions guards against os.WriteFile's mode
+// argument being a no-op on an existing file: it pre-creates the config at
+// 0644, writes through writeConfig, and requires the mode end at 0600.
+func TestWriteConfigFixesLoosePermissions(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/config.toml"
+
+	if err := os.WriteFile(path, []byte("stale"), 0644); err != nil {
+		t.Fatalf("pre-creating file: %v", err)
+	}
+
+	cfg := &tuiConfig{Active: "home", Profiles: map[string]tuiProfile{"home": {DatabaseURL: "postgres://user:pass@host:5432/db"}}}
+	if err := writeConfig(path, cfg); err != nil {
+		t.Fatalf("writeConfig: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Errorf("mode after writeConfig over a pre-existing 0644 file = %o, want 0600", got)
 	}
 }
