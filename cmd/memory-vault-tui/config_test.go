@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bufio"
+	"errors"
+	"io"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -15,6 +19,7 @@ func TestValidateDatabaseURLShape(t *testing.T) {
 		{"malformed scheme", "mysql://user:pass@host:5432/db", true},
 		{"no scheme at all", "hello", true},
 		{"missing host", "postgres:///db", true},
+		{"missing hostname with port", "postgres://:5432/db", true},
 		{"valid postgres scheme", "postgres://user:pass@host:5432/db", false},
 		{"valid postgresql scheme", "postgresql://user:pass@host:5432/db", false},
 	}
@@ -45,6 +50,16 @@ func TestRedactURLPassword(t *testing.T) {
 	want = "http://user:***@192.168.1.44:11434"
 	if got != want {
 		t.Errorf("redactURLPassword (ollama URL): got %q, want %q", got, want)
+	}
+	got = redactURLPassword("postgres://user:se@cret@host:5432/db")
+	want = "postgres://user:***@host:5432/db"
+	if got != want {
+		t.Errorf("redactURLPassword (password with @): got %q, want %q", got, want)
+	}
+	got = redactURLPassword("postgres://user@host:5432/db?password=secret&sslmode=disable")
+	want = "postgres://user@host:5432/db?password=***&sslmode=disable"
+	if got != want {
+		t.Errorf("redactURLPassword (query password): got %q, want %q", got, want)
 	}
 }
 
@@ -95,17 +110,41 @@ func TestWriteConfigFixesLoosePermissions(t *testing.T) {
 	if err := os.WriteFile(path, []byte("stale"), 0644); err != nil {
 		t.Fatalf("pre-creating file: %v", err)
 	}
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatalf("chmod pre-created file: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat pre-created file: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0644 {
+		t.Fatalf("mode before writeConfig = %o, want 0644", got)
+	}
 
 	cfg := &tuiConfig{Active: "home", Profiles: map[string]tuiProfile{"home": {DatabaseURL: "postgres://user:pass@host:5432/db"}}}
 	if err := writeConfig(path, cfg); err != nil {
 		t.Fatalf("writeConfig: %v", err)
 	}
 
-	info, err := os.Stat(path)
+	info, err = os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
 	if got := info.Mode().Perm(); got != 0600 {
 		t.Errorf("mode after writeConfig over a pre-existing 0644 file = %o, want 0600", got)
+	}
+}
+
+func TestPromptYesNoEOF(t *testing.T) {
+	_, err := promptYesNo(bufio.NewReader(strings.NewReader("")), "confirm? ", true)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("promptYesNo error = %v, want EOF", err)
+	}
+}
+
+func TestPromptWizardEOF(t *testing.T) {
+	_, _, err := promptWizard(bufio.NewReader(strings.NewReader("")), "home")
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("promptWizard error = %v, want EOF", err)
 	}
 }

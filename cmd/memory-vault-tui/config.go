@@ -129,31 +129,66 @@ func quoteTOMLString(s string) string {
 	return `"` + s + `"`
 }
 
-// writeConfig always ends with the file at 0600: the file holds Postgres
-// credentials. The WriteFile mode argument only takes effect when it
-// creates the file — on an existing file (e.g. left at 0644 by an older
-// version, or a looser umask) it's ignored and the old mode sticks, so the
-// mode is set explicitly afterward rather than trusted to WriteFile alone.
+// writeConfig writes the whole config through a private temp file in the
+// target directory, then renames it into place so the config is never
+// replaced by a partially-written file. The file holds Postgres
+// credentials, so every write keeps it at 0600.
 func writeConfig(path string, cfg *tuiConfig) error {
 	var b strings.Builder
-	b.WriteString("active = " + quoteTOMLString(cfg.Active) + "\n")
+	b.WriteString("active = ")
+	b.WriteString(quoteTOMLString(cfg.Active))
+	b.WriteByte('\n')
 	names := make([]string, 0, len(cfg.Profiles))
 	for name := range cfg.Profiles {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		b.WriteString("\n[profiles." + name + "]\n")
-		b.WriteString("database_url = " + quoteTOMLString(cfg.Profiles[name].DatabaseURL) + "\n")
-		b.WriteString("ollama_url = " + quoteTOMLString(cfg.Profiles[name].OllamaURL) + "\n")
+		b.WriteString("\n[profiles.")
+		b.WriteString(name)
+		b.WriteString("]\n")
+		b.WriteString("database_url = ")
+		b.WriteString(quoteTOMLString(cfg.Profiles[name].DatabaseURL))
+		b.WriteByte('\n')
+		b.WriteString("ollama_url = ")
+		b.WriteString(quoteTOMLString(cfg.Profiles[name].OllamaURL))
+		b.WriteByte('\n')
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, []byte(b.String()), 0600); err != nil {
+	tmp, err := os.CreateTemp(dir, ".config.toml-*")
+	if err != nil {
 		return err
 	}
-	return os.Chmod(path, 0600)
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(b.String()); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
 }
 
 // validateDatabaseURLShape rejects obviously-wrong input before it ever
@@ -167,7 +202,7 @@ func validateDatabaseURLShape(raw string) error {
 	if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
 		return fmt.Errorf("that doesn't look like a Postgres connection URL — expected something starting with postgres://")
 	}
-	if u.Host == "" {
+	if u.Hostname() == "" {
 		return fmt.Errorf("that doesn't look like a Postgres connection URL — missing a host")
 	}
 	return nil
@@ -199,37 +234,71 @@ func testConnection(databaseURL string) error {
 // URL.String() percent-encodes characters like "*" in userinfo — which
 // would print a mangled mask instead of "***".
 func redactURLPassword(raw string) string {
+	redacted := raw
 	schemeEnd := strings.Index(raw, "://")
 	if schemeEnd < 0 {
-		return raw
+		return redactSensitiveQueryParams(redacted)
 	}
-	rest := raw[schemeEnd+3:]
-	at := strings.Index(rest, "@")
-	if at < 0 {
-		return raw // no userinfo
+	authorityStart := schemeEnd + 3
+	authorityEnd := len(raw)
+	for _, sep := range []string{"/", "?", "#"} {
+		if idx := strings.Index(raw[authorityStart:], sep); idx >= 0 && authorityStart+idx < authorityEnd {
+			authorityEnd = authorityStart + idx
+		}
 	}
-	userinfo := rest[:at]
-	colon := strings.Index(userinfo, ":")
-	if colon < 0 {
-		return raw // no password to redact
+	authority := raw[authorityStart:authorityEnd]
+	at := strings.LastIndex(authority, "@")
+	if at >= 0 {
+		userinfo := authority[:at]
+		if colon := strings.Index(userinfo, ":"); colon >= 0 {
+			redacted = raw[:authorityStart] + userinfo[:colon] + ":***" + authority[at:] + raw[authorityEnd:]
+		}
 	}
-	return raw[:schemeEnd+3] + userinfo[:colon] + ":***" + rest[at:]
+	return redactSensitiveQueryParams(redacted)
 }
 
-func promptLine(reader *bufio.Reader, prompt string) string {
+func redactSensitiveQueryParams(raw string) string {
+	queryStart := strings.Index(raw, "?")
+	if queryStart < 0 {
+		return raw
+	}
+	queryEnd := len(raw)
+	if frag := strings.Index(raw[queryStart+1:], "#"); frag >= 0 {
+		queryEnd = queryStart + 1 + frag
+	}
+	parts := strings.Split(raw[queryStart+1:queryEnd], "&")
+	for i, part := range parts {
+		key := part
+		eq := strings.Index(part, "=")
+		if eq >= 0 {
+			key = part[:eq]
+		}
+		decodedKey, err := url.QueryUnescape(key)
+		if err == nil && strings.EqualFold(decodedKey, "password") && eq >= 0 {
+			parts[i] = part[:eq+1] + "***"
+		}
+	}
+	return raw[:queryStart+1] + strings.Join(parts, "&") + raw[queryEnd:]
+}
+
+func promptLine(reader *bufio.Reader, prompt string) (string, error) {
 	if prompt != "" {
 		fmt.Print(prompt)
 	}
-	line, _ := reader.ReadString('\n')
-	return strings.TrimSpace(line)
+	line, err := reader.ReadString('\n')
+	return strings.TrimSpace(line), err
 }
 
-func promptYesNo(reader *bufio.Reader, prompt string, defaultYes bool) bool {
-	answer := strings.ToLower(promptLine(reader, prompt))
-	if answer == "" {
-		return defaultYes
+func promptYesNo(reader *bufio.Reader, prompt string, defaultYes bool) (bool, error) {
+	answer, err := promptLine(reader, prompt)
+	if err != nil {
+		return false, err
 	}
-	return answer == "y" || answer == "yes"
+	answer = strings.ToLower(answer)
+	if answer == "" {
+		return defaultYes, nil
+	}
+	return answer == "y" || answer == "yes", nil
 }
 
 // promptWizard collects and validates one profile: a name, a Postgres URL
@@ -239,7 +308,10 @@ func promptYesNo(reader *bufio.Reader, prompt string, defaultYes bool) bool {
 // do with the result.
 func promptWizard(reader *bufio.Reader, defaultName string) (name string, profile tuiProfile, err error) {
 	for {
-		name = promptLine(reader, fmt.Sprintf("Profile name [%s]: ", defaultName))
+		name, err = promptLine(reader, fmt.Sprintf("Profile name [%s]: ", defaultName))
+		if err != nil {
+			return "", tuiProfile{}, err
+		}
 		if name == "" {
 			name = defaultName
 		}
@@ -250,7 +322,10 @@ func promptWizard(reader *bufio.Reader, defaultName string) (name string, profil
 	}
 
 	for {
-		profile.DatabaseURL = promptLine(reader, "Postgres connection URL (postgres://user:pass@host:5432/dbname): ")
+		profile.DatabaseURL, err = promptLine(reader, "Postgres connection URL (postgres://user:pass@host:5432/dbname): ")
+		if err != nil {
+			return "", tuiProfile{}, err
+		}
 		if shapeErr := validateDatabaseURLShape(profile.DatabaseURL); shapeErr != nil {
 			fmt.Println(shapeErr)
 			continue
@@ -258,7 +333,11 @@ func promptWizard(reader *bufio.Reader, defaultName string) (name string, profil
 		fmt.Println("Testing connection...")
 		if connErr := testConnection(profile.DatabaseURL); connErr != nil {
 			fmt.Println(connErr)
-			if !promptYesNo(reader, "Try again? [Y/n]: ", true) {
+			retry, err := promptYesNo(reader, "Try again? [Y/n]: ", true)
+			if err != nil {
+				return "", tuiProfile{}, err
+			}
+			if !retry {
 				return "", tuiProfile{}, fmt.Errorf("setup cancelled")
 			}
 			continue
@@ -267,7 +346,10 @@ func promptWizard(reader *bufio.Reader, defaultName string) (name string, profil
 		break
 	}
 
-	profile.OllamaURL = promptLine(reader, fmt.Sprintf("Ollama URL [%s]: ", defaultOllamaURL))
+	profile.OllamaURL, err = promptLine(reader, fmt.Sprintf("Ollama URL [%s]: ", defaultOllamaURL))
+	if err != nil {
+		return "", tuiProfile{}, err
+	}
 	if profile.OllamaURL == "" {
 		profile.OllamaURL = defaultOllamaURL
 	}
@@ -405,7 +487,11 @@ func configAdd(path string) error {
 	}
 
 	if _, exists := cfg.Profiles[name]; exists {
-		if !promptYesNo(reader, fmt.Sprintf("Profile %q already exists. Overwrite? [y/N]: ", name), false) {
+		overwrite, err := promptYesNo(reader, fmt.Sprintf("Profile %q already exists. Overwrite? [y/N]: ", name), false)
+		if err != nil {
+			return err
+		}
+		if !overwrite {
 			return fmt.Errorf("cancelled")
 		}
 	}
@@ -490,7 +576,11 @@ func configRemove(path, name string, force bool) error {
 	}
 	if name == cfg.Active && !force {
 		reader := bufio.NewReader(os.Stdin)
-		if !promptYesNo(reader, fmt.Sprintf("%q is the active profile. Remove anyway? [y/N]: ", name), false) {
+		confirm, err := promptYesNo(reader, fmt.Sprintf("%q is the active profile. Remove anyway? [y/N]: ", name), false)
+		if err != nil {
+			return err
+		}
+		if !confirm {
 			return fmt.Errorf("cancelled (use --force to skip this prompt)")
 		}
 	}

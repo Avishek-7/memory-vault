@@ -246,12 +246,14 @@ it to that tenant's memories. It is a local admin tool for the vault the
 server was started on, not a way to browse other tenants.
 
 **Connection profiles.** The first run with no saved config prompts for a
-profile name and a `postgres://` URL, tests the connection before saving
-anything, and writes it to `~/.config/memory-vault/config.toml` (actually
+profile name and a `postgres://` URL, then opens the store through the same
+startup path a real launch uses. That means the check may run the
+idempotent schema migration as part of `store.Open`, and the profile is only
+written to `~/.config/memory-vault/config.toml` (actually
 `os.UserConfigDir()`, which is `~/Library/Application Support/memory-vault`
-on macOS) at mode `0600`. Every run after that connects straight through,
-same as the old `DATABASE_URL`-per-run flow but without having to set it
-every time.
+on macOS) at mode `0600` after that test succeeds. Every run after that
+connects straight through, same as the old `DATABASE_URL`-per-run flow but
+without having to set it every time.
 
 ```text
 memory-vault-tui config add          # add another named profile
