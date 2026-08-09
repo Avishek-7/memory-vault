@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -432,5 +433,63 @@ func TestCompactionRefusesToGrowStorage(t *testing.T) {
 	merged := compactTargetName([]string{centroids[0].Name, centroids[1].Name})
 	if got, _ := vault.Reassemble(space, merged); got != "" {
 		t.Errorf("the oversized merge was written anyway (%d bytes)", len(got))
+	}
+}
+
+func TestClientIPPrefersForwardedFor(t *testing.T) {
+	t.Setenv("TRUSTED_PROXY_IPS", "10.0.0.1")
+	cases := []struct {
+		name       string
+		remoteAddr string
+		forwardFor string
+		want       string
+	}{
+		{"no proxy header, falls back to RemoteAddr", "203.0.113.9:54321", "", "203.0.113.9:54321"},
+		{"single hop from a trusted proxy", "10.0.0.1:1234", "198.51.100.7", "198.51.100.7"},
+		{"multiple hops, takes the first (original client)", "10.0.0.1:1234", "198.51.100.7, 10.0.0.2, 10.0.0.1", "198.51.100.7"},
+		{"whitespace around the first hop is trimmed", "10.0.0.1:1234", " 198.51.100.7 , 10.0.0.2", "198.51.100.7"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/healthz", nil)
+			r.RemoteAddr = c.remoteAddr
+			if c.forwardFor != "" {
+				r.Header.Set("X-Forwarded-For", c.forwardFor)
+			}
+			if got := clientIP(r); got != c.want {
+				t.Errorf("clientIP() = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestClientIPIgnoresForwardedForFromUntrustedPeer is the load-bearing case:
+// this deployment publishes memory-vault's port straight to the LAN
+// (docker-compose.yml's "ports: - 8080:8080") alongside routing it through
+// Traefik, so a caller reaching that port directly — RemoteAddr is then
+// their own real address, Docker port-publishing doesn't inject a proxy
+// hop — could set X-Forwarded-For to anything. Without gating on
+// TRUSTED_PROXY_IPS, that forged value would silently overwrite the real
+// source in every denial log line.
+func TestClientIPIgnoresForwardedForFromUntrustedPeer(t *testing.T) {
+	t.Setenv("TRUSTED_PROXY_IPS", "10.0.0.1")
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/healthz", nil)
+	r.RemoteAddr = "203.0.113.9:54321" // not in TRUSTED_PROXY_IPS
+	r.Header.Set("X-Forwarded-For", "198.51.100.7")
+	if got := clientIP(r); got != r.RemoteAddr {
+		t.Errorf("clientIP() = %q, want the real RemoteAddr %q — a forged X-Forwarded-For from an untrusted peer must not override it", got, r.RemoteAddr)
+	}
+}
+
+// TestClientIPDefaultsToDistrustingForwardedFor covers TRUSTED_PROXY_IPS
+// being unset entirely — same fail-closed default as ALLOWED_HOSTS being
+// empty, just inverted (there it means "skip the check", here it means
+// "never trust the header").
+func TestClientIPDefaultsToDistrustingForwardedFor(t *testing.T) {
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/healthz", nil)
+	r.RemoteAddr = "172.18.0.5:54321"
+	r.Header.Set("X-Forwarded-For", "198.51.100.7")
+	if got := clientIP(r); got != r.RemoteAddr {
+		t.Errorf("clientIP() with TRUSTED_PROXY_IPS unset = %q, want RemoteAddr %q", got, r.RemoteAddr)
 	}
 }

@@ -633,6 +633,10 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error: --profile requires a profile name")
 			os.Exit(1)
 		}
+		if len(args) > 2 {
+			fmt.Fprintln(os.Stderr, "error: --profile accepts exactly one profile name")
+			os.Exit(1)
+		}
 		profileOverride = args[1]
 	}
 

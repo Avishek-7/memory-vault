@@ -398,6 +398,17 @@ func Open(cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// database/sql sets no finalizer on *sql.DB, so a pool left behind on
+	// any error path below leaks its connections for the life of the
+	// process. closeOnErr covers every return until the successful one,
+	// which clears it — that way a future check added to this function
+	// can't forget to close db on its own error path.
+	closeOnErr := true
+	defer func() {
+		if closeOnErr {
+			db.Close()
+		}
+	}()
 	if err := db.Ping(); err != nil {
 		return nil, err
 	}
@@ -420,6 +431,7 @@ func Open(cfg Config) (*Store, error) {
 	// Default to the bootstrap tenant, which owns every row written before
 	// multi-tenancy — so a single-tenant deploy behaves exactly as it did.
 	// Per-request scoping comes from ForTenant.
+	closeOnErr = false
 	return &Store{
 		db:       &tenantDB{pool: db, tenant: BootstrapTenantID, bindSQL: bindStatement(iterativeScan)},
 		Embedder: embedder,

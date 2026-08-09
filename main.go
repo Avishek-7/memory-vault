@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -1010,6 +1012,49 @@ func checkHost(r *http.Request) bool {
 	return false
 }
 
+// trustedProxyIPs returns the TRUSTED_PROXY_IPS allowlist (comma-separated
+// bare IPs, no port — Traefik's address on the compose network). Empty
+// means X-Forwarded-For is never trusted, same fail-closed default as
+// allowedHosts/ALLOWED_HOSTS above.
+func trustedProxyIPs() []string {
+	raw := os.Getenv("TRUSTED_PROXY_IPS")
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, ",")
+}
+
+// clientIP prefers the first X-Forwarded-For hop over r.RemoteAddr, but
+// only when RemoteAddr itself is a configured trusted proxy. Without that
+// check this would be a log-forging vector, not a fix for one: ALLOWED_HOSTS
+// on this deployment lists both the Traefik-fronted hostname and a direct
+// "host:8080" address, because docker-compose.yml publishes this port
+// straight to the LAN interface (`ports: - "8080:8080"`) alongside routing
+// it through Traefik. Anyone who can reach the published port directly
+// bypasses Traefik entirely and can set X-Forwarded-For to whatever they
+// like — Docker's port publishing preserves the real source IP as
+// RemoteAddr, it does not inject a proxy hop, so an unguarded trust of the
+// header would let that caller's forged value overwrite it in every log
+// line. A request actually proxied through Traefik has RemoteAddr equal to
+// Traefik's own container address, which is what TRUSTED_PROXY_IPS names.
+func clientIP(r *http.Request) string {
+	fwd := r.Header.Get("X-Forwarded-For")
+	if fwd == "" {
+		return r.RemoteAddr
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	for _, trusted := range trustedProxyIPs() {
+		if host == trusted {
+			first, _, _ := strings.Cut(fwd, ",")
+			return strings.TrimSpace(first)
+		}
+	}
+	return r.RemoteAddr
+}
+
 // healthzHandler answers "can this instance serve MCP requests" — a cheap
 // Postgres ping, nothing more. It deliberately doesn't check Ollama:
 // embedding/chat calls failing because Ollama is down is a lesser,
@@ -1022,6 +1067,7 @@ func checkHost(r *http.Request) bool {
 // health on possession of a secret.
 func healthzHandler(w http.ResponseWriter, r *http.Request) {
 	if !checkHost(r) {
+		log.Printf("healthz: rejected Host %q from %s", r.Host, clientIP(r))
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -1037,11 +1083,16 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 
 func mcpHandler(w http.ResponseWriter, r *http.Request) {
 	if !checkHost(r) {
+		log.Printf("mcp: rejected Host %q from %s", r.Host, clientIP(r))
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	vault, ok := authenticate(r)
 	if !ok {
+		// Never log the credential itself: a mistyped guess is often a real
+		// but revoked/expired key, and this line ends up in Dozzle's shared
+		// log view — a wider audience than the database holding the hash.
+		log.Printf("mcp: auth rejected from %s", clientIP(r))
 		w.Header().Set("WWW-Authenticate", `Bearer realm="memory-vault"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -1055,6 +1106,7 @@ func mcpHandler(w http.ResponseWriter, r *http.Request) {
 		tenant := vault.TenantID()
 		if !tenantLimiter.Allow(tenant, limits.RequestsPerMinute, limits.Burst) {
 			retry := tenantLimiter.RetryAfter(tenant, limits.RequestsPerMinute)
+			log.Printf("mcp: rate limit exceeded for tenant %s from %s", tenant, clientIP(r))
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(retry)))
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
@@ -1174,7 +1226,7 @@ func runImportCLI(args []string) {
 // surface to authenticate, so there is none to get wrong.
 func runTenantCLI(args []string) {
 	if len(args) == 0 {
-		log.Fatal("usage: memory-vault tenant create|list")
+		log.Fatal("usage: memory-vault tenant create|list|delete")
 	}
 	switch args[0] {
 	case "create":
@@ -1207,8 +1259,39 @@ func runTenantCLI(args []string) {
 			fmt.Printf("%s\t%s\t%s\t%s\n", t.ID, t.Email, t.Plan, t.CreatedAt.Format(time.RFC3339))
 		}
 
+	case "delete":
+		fs := flag.NewFlagSet("tenant delete", flag.ExitOnError)
+		id := fs.String("id", "", "tenant id to delete (see `tenant list`)")
+		force := fs.Bool("force", false, "skip the interactive confirmation prompt (for scripted use)")
+		fs.Parse(args[1:])
+		if *id == "" {
+			log.Fatal("tenant delete: -id is required")
+		}
+		if !*force {
+			fmt.Printf("This will permanently delete tenant %s and all of its memories and API keys — this cannot be undone.\nType the tenant id to confirm: ", *id)
+			reader := bufio.NewReader(os.Stdin)
+			line, err := reader.ReadString('\n')
+			trimmed := strings.TrimSpace(line)
+			if err != nil {
+				if !(err == io.EOF && trimmed != "") {
+					log.Fatalf("tenant delete: reading confirmation: %v", err)
+				}
+			}
+			if trimmed != *id {
+				log.Fatal("tenant delete: confirmation did not match, aborted")
+			}
+		}
+		summary, err := st.DeleteTenantWithSummary(*id)
+		if err != nil {
+			log.Fatalf("tenant delete: %v", err)
+		}
+		if !summary.Deleted {
+			log.Fatalf("tenant delete: no tenant with id %s", *id)
+		}
+		fmt.Printf("deleted tenant %s (%d memories, %d API keys removed via cascade)\n", *id, summary.Memories, summary.APIKeys)
+
 	default:
-		log.Fatalf("unknown tenant subcommand %q (want create or list)", args[0])
+		log.Fatalf("unknown tenant subcommand %q (want create, list, or delete)", args[0])
 	}
 }
 

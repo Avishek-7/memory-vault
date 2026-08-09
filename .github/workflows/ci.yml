@@ -38,6 +38,9 @@ jobs:
           PGPASSWORD: postgres
         run: psql -h localhost -U postgres -d memory_vault_test -v ON_ERROR_STOP=1 -f deploy/init-db.sql
       - run: go vet ./...
+      - uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: "1.26"
       - run: go test ./... -v
         env:
           DATABASE_URL: postgres://memory_vault_app:memory_vault_app@localhost:5432/memory_vault_test?sslmode=disable
