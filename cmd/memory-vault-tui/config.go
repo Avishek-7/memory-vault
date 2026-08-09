@@ -12,6 +12,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -294,7 +295,7 @@ func promptLine(reader *bufio.Reader, prompt string) (string, error) {
 	}
 	line, err := reader.ReadString('\n')
 	trimmed := strings.TrimSpace(line)
-	if err != nil && trimmed != "" {
+	if err == io.EOF && trimmed != "" {
 		err = nil
 	}
 	return trimmed, err

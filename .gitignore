@@ -12,3 +12,8 @@
 
 # OS files
 .DS_Store
+
+# Local session notes (fallback when memory-vault is unreachable)
+SESSION_LOG.md
+
+memory-vault-launch-checklist.md

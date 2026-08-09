@@ -249,9 +249,9 @@ server was started on, not a way to browse other tenants.
 profile name and a `postgres://` URL, then opens the store through the same
 startup path a real launch uses. That means the check may run the
 idempotent schema migration as part of `store.Open`, and the profile is only
-written to `~/.config/memory-vault/config.toml` (actually
-`os.UserConfigDir()`, which is `~/Library/Application Support/memory-vault`
-on macOS) at mode `0600` after that test succeeds. Every run after that
+written to `os.UserConfigDir()/memory-vault/config.toml` (for example,
+`~/Library/Application Support/memory-vault/config.toml` on macOS) at mode
+`0600` after that test succeeds. Every run after that
 connects straight through, same as the old `DATABASE_URL`-per-run flow but
 without having to set it every time.
 
@@ -427,7 +427,7 @@ Environment variables:
 | `MAX_REQUEST_BODY_MB` | `25` | Max `/mcp` request body size, in MB — guards against unbounded-memory requests (e.g. an oversized `import_memories` payload) |
 | `AUTH_TOKEN` | *(none)* | Shared bearer token(s) authenticating as the bootstrap tenant (comma-separated for multiple clients). If unset, `/mcp` is open only while no API key exists — see [Tenants and API keys](#tenants-and-api-keys) |
 | `ALLOWED_HOSTS` | *(none)* | Comma-separated `Host` header allowlist, guards against DNS-rebinding. If unset, the check is skipped — set this in production. |
-| `TRUSTED_PROXY_IPS` | *(none)* | Comma-separated bare IPs (no port) allowed to set `X-Forwarded-For` for logging — normally just your reverse proxy's address on the docker network. If unset, `X-Forwarded-For` is never trusted and logs show the connecting peer's real address instead. **Only relevant if this port is also reachable directly** (e.g. published to the LAN alongside being proxied) — otherwise every caller's `RemoteAddr` already *is* the proxy, and trusting the header there would let a caller who bypasses the proxy forge what gets logged. |
+| `TRUSTED_PROXY_IPS` | *(none)* | Comma-separated bare IPs (no port) allowed to set `X-Forwarded-For` for logging — normally your reverse proxy's address on the docker network. This enables resolved client-IP logging from `X-Forwarded-For` even when all traffic passes through that proxy. If unset, `X-Forwarded-For` is never trusted and logs show only the connecting peer. If direct access to this port is also possible, the trusted-peer check ensures only configured proxy IPs can influence the logged client address, so direct callers cannot forge it. |
 | `PLAN_<PLAN>_RPM` | per plan | Sustained requests/minute for `FREE`/`BUILDER`/`TEAM`; `0` disables the limit — see [Plans, rate limits, and quotas](#plans-rate-limits-and-quotas) |
 | `PLAN_<PLAN>_BURST` | per plan | How many requests an idle tenant may make at once (capped at that plan's `RPM`) |
 | `PLAN_<PLAN>_MAX_MEMORIES` | per plan | Maximum memories a tenant on that plan may store; `0` disables the limit |

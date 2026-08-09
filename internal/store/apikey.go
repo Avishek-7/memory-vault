@@ -162,6 +162,13 @@ type APIKeyInfo struct {
 	RevokedAt sql.NullTime
 }
 
+// TenantDeleteSummary reports what an atomic tenant delete removed.
+type TenantDeleteSummary struct {
+	Deleted  bool
+	Memories int
+	APIKeys  int
+}
+
 // APIKeys lists a tenant's keys, including revoked ones, so an operator can
 // see what was issued and when it was withdrawn.
 func (s *Store) APIKeys(tenantID string) ([]APIKeyInfo, error) {
@@ -213,18 +220,54 @@ func (s *Store) RevokeAPIKey(id string) (bool, error) {
 // see the uuid type docs), so a plain Go string compare against the
 // canonical form could let one of those slip past the guard while
 // DELETE's own WHERE clause still matched the real bootstrap row.
-func (s *Store) DeleteTenant(tenantID string) (bool, error) {
+func (s *Store) DeleteTenantWithSummary(tenantID string) (TenantDeleteSummary, error) {
 	var isBootstrap bool
 	if err := s.db.pool.QueryRow(`SELECT $1::uuid = $2::uuid`, tenantID, BootstrapTenantID).Scan(&isBootstrap); err != nil {
-		return false, fmt.Errorf("validating tenant id: %w", err)
+		return TenantDeleteSummary{}, fmt.Errorf("validating tenant id: %w", err)
 	}
 	if isBootstrap {
-		return false, fmt.Errorf("refusing to delete the bootstrap tenant (%s) — it owns every pre-multi-tenancy row", BootstrapTenantID)
+		return TenantDeleteSummary{}, fmt.Errorf("refusing to delete the bootstrap tenant (%s) — it owns every pre-multi-tenancy row", BootstrapTenantID)
 	}
-	res, err := s.db.pool.Exec(`DELETE FROM tenants WHERE id = $1`, tenantID)
+
+	tx, err := s.db.pool.Begin()
 	if err != nil {
-		return false, err
+		return TenantDeleteSummary{}, err
+	}
+	defer tx.Rollback()
+
+	if err := tx.QueryRow(`SELECT id::text FROM tenants WHERE id = $1 FOR UPDATE`, tenantID).Scan(new(string)); err == sql.ErrNoRows {
+		return TenantDeleteSummary{Deleted: false}, nil
+	} else if err != nil {
+		return TenantDeleteSummary{}, err
+	}
+
+	var out TenantDeleteSummary
+	out.Deleted = true
+	if err := tx.QueryRow(`SELECT COUNT(DISTINCT (space, name)) FROM memories WHERE tenant_id = $1`, tenantID).Scan(&out.Memories); err != nil {
+		return TenantDeleteSummary{}, err
+	}
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM api_keys WHERE tenant_id = $1`, tenantID).Scan(&out.APIKeys); err != nil {
+		return TenantDeleteSummary{}, err
+	}
+
+	res, err := tx.Exec(`DELETE FROM tenants WHERE id = $1`, tenantID)
+	if err != nil {
+		return TenantDeleteSummary{}, err
 	}
 	affected, err := res.RowsAffected()
-	return affected > 0, err
+	if err != nil {
+		return TenantDeleteSummary{}, err
+	}
+	if affected == 0 {
+		return TenantDeleteSummary{Deleted: false}, tx.Commit()
+	}
+	if err := tx.Commit(); err != nil {
+		return TenantDeleteSummary{}, err
+	}
+	return out, nil
+}
+
+func (s *Store) DeleteTenant(tenantID string) (bool, error) {
+	summary, err := s.DeleteTenantWithSummary(tenantID)
+	return summary.Deleted, err
 }

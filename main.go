@@ -1267,33 +1267,28 @@ func runTenantCLI(args []string) {
 		if *id == "" {
 			log.Fatal("tenant delete: -id is required")
 		}
-		// Both counts are taken before the delete: the tenant row and
-		// everything cascading from it are gone the moment DeleteTenant
-		// returns, so this is the only chance to report what was removed.
-		usage, err := st.ForTenant(*id).Usage()
-		if err != nil {
-			log.Fatalf("tenant delete: checking usage: %v", err)
-		}
-		keys, err := st.APIKeys(*id)
-		if err != nil {
-			log.Fatalf("tenant delete: checking keys: %v", err)
-		}
 		if !*force {
-			fmt.Printf("This will permanently delete tenant %s and all %d of its memories and %d API keys — this cannot be undone.\nType the tenant id to confirm: ", *id, usage.Memories, len(keys))
+			fmt.Printf("This will permanently delete tenant %s and all of its memories and API keys — this cannot be undone.\nType the tenant id to confirm: ", *id)
 			reader := bufio.NewReader(os.Stdin)
-			line, _ := reader.ReadString('\n')
-			if strings.TrimSpace(line) != *id {
+			line, err := reader.ReadString('\n')
+			trimmed := strings.TrimSpace(line)
+			if err != nil {
+				if !(err == io.EOF && trimmed != "") {
+					log.Fatalf("tenant delete: reading confirmation: %v", err)
+				}
+			}
+			if trimmed != *id {
 				log.Fatal("tenant delete: confirmation did not match, aborted")
 			}
 		}
-		deleted, err := st.DeleteTenant(*id)
+		summary, err := st.DeleteTenantWithSummary(*id)
 		if err != nil {
 			log.Fatalf("tenant delete: %v", err)
 		}
-		if !deleted {
+		if !summary.Deleted {
 			log.Fatalf("tenant delete: no tenant with id %s", *id)
 		}
-		fmt.Printf("deleted tenant %s (%d memories, %d API keys removed via cascade)\n", *id, usage.Memories, len(keys))
+		fmt.Printf("deleted tenant %s (%d memories, %d API keys removed via cascade)\n", *id, summary.Memories, summary.APIKeys)
 
 	default:
 		log.Fatalf("unknown tenant subcommand %q (want create, list, or delete)", args[0])

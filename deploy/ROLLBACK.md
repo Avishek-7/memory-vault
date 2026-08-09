@@ -14,7 +14,9 @@ the rollback mechanism: `:latest` always moves, the sha tag never does.
 
 ```bash
 # On the host running memory-vault (docker-compose.yml):
-git log --oneline -5                 # find the last-known-good commit
+# Choose <good-sha> from deployment evidence (release/deploy history,
+# recorded image digest/SHA, incident timeline) and use one that was
+# previously verified in production. Do not infer it from the host checkout.
 docker pull ghcr.io/avishek-7/memory-vault:<good-sha>
 docker tag ghcr.io/avishek-7/memory-vault:<good-sha> \
            ghcr.io/avishek-7/memory-vault:latest
@@ -30,7 +32,9 @@ forget you did.
 **Verify before declaring it fixed**, not just that the container started:
 
 ```bash
-curl -s -H "Host: <your ALLOWED_HOSTS value>" http://localhost:8080/healthz
+curl --fail --silent --show-error --connect-timeout 5 --max-time 10 \
+  -H "Host: <your ALLOWED_HOSTS value>" \
+  http://localhost:8080/healthz
 docker logs memory-vault --tail 20
 ```
 
@@ -60,29 +64,57 @@ restoring from backup.** Don't go looking for a `migrate down` command;
 there isn't one.
 
 ```bash
+set -euo pipefail
+
 # 1. Stop the app so nothing writes against the bad schema while you work.
 docker compose stop memory-vault
 
 # 2. Fetch and decrypt the last good backup — same repo/branch backup.sh
 #    pushes to, same steps standby-sync.sh already automates. AGE_IDENTITY
 #    is the private half of backup.sh's AGE_RECIPIENT.
-git clone --quiet "$BACKUP_GIT_REMOTE" /tmp/mv-restore
-age -d -i "$AGE_IDENTITY" -o /tmp/mv-restore/dump.sql \
-    /tmp/mv-restore/memory-vault-dump.sql.age
+restore_dir="$(mktemp -d)"
+umask 077
+trap 'rm -rf "$restore_dir"' EXIT INT TERM
+
+BACKUP_COMMIT="<named-backup-commit-sha>"
+BAD_MIGRATION_UNIX_TS="<unix-seconds-when-bad-migration-ran>"
+
+git clone --quiet "$BACKUP_GIT_REMOTE" "$restore_dir"
+git -C "$restore_dir" checkout --quiet "$BACKUP_COMMIT"
+backup_ts="$(git -C "$restore_dir" show -s --format=%ct "$BACKUP_COMMIT")"
+if [ "$backup_ts" -ge "$BAD_MIGRATION_UNIX_TS" ]; then
+  echo "selected backup commit is not older than the bad migration" >&2
+  exit 1
+fi
+
+age -d -i "$AGE_IDENTITY" -o "$restore_dir/dump.sql" \
+    "$restore_dir/memory-vault-dump.sql.age"
 
 # 3. Restore it. --clean --if-exists means this replaces the current
-#    schema, it does not merge with it. See README's "Backups cover every
-#    tenant" for what SUPERUSER_DATABASE_URL needs to be.
-psql "$SUPERUSER_DATABASE_URL" -v ON_ERROR_STOP=1 -f /tmp/mv-restore/dump.sql
+#    schema, it does not merge with it (backup.sh's pg_dump uses those flags).
+#    See README's "Backups cover every tenant" for what SUPERUSER_DATABASE_URL
+#    needs to be.
+psql "$SUPERUSER_DATABASE_URL" --single-transaction -v ON_ERROR_STOP=1 \
+  -f "$restore_dir/dump.sql"
 
 # 4. Roll the image back too if the bad migration shipped inside a bad
 #    commit (part 1) — otherwise the same image just re-runs the same
 #    migration against the just-restored schema on its next start.
 
-# 5. Bring the app back up and verify (see part 1's checks) before
+# 5. Verify restored database state before bringing the app back up.
+psql "$SUPERUSER_DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+SELECT id, email, plan FROM tenants ORDER BY created_at LIMIT 10;
+SELECT tenant_id, COUNT(DISTINCT (space, name)) AS memories
+FROM memories GROUP BY tenant_id ORDER BY tenant_id;
+SELECT relname, relrowsecurity, relforcerowsecurity
+FROM pg_class
+WHERE relname = 'memories';
+SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';
+SQL
+
+# 6. Bring the app back up and verify (see part 1's checks) before
 #    declaring the incident over.
 docker compose up -d memory-vault
-rm -rf /tmp/mv-restore
 ```
 
 Any write made between the bad migration landing and the restore is lost —
@@ -106,12 +138,17 @@ running database, not just assumed to work:
 
 ```bash
 # Fresh volume + throwaway container, never the live one:
+docker rm -f restore-test >/dev/null 2>&1 || true
+docker volume rm -f restore-test >/dev/null 2>&1 || true
 docker volume create restore-test
 docker run --rm -v restore-test:/var/lib/postgresql/data \
   -v <backup-source>:/backup:ro alpine \
   sh -c "tar xzf /backup/<file>.tar.gz -C /var/lib/postgresql/data && chown -R 999:999 /var/lib/postgresql/data"
 docker run -d --name restore-test -v restore-test:/var/lib/postgresql/data \
   -e POSTGRES_USER=<user> -e POSTGRES_PASSWORD=<password> pgvector/pgvector:pg16
+# ...run validation queries...
+docker rm -f restore-test
+docker volume rm -f restore-test
 ```
 
 Result: Postgres detected the unclean shutdown (expected — the tar was

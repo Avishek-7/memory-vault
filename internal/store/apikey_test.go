@@ -242,12 +242,18 @@ func TestDeleteTenantCascades(t *testing.T) {
 		t.Fatalf("SaveMemory: %v", err)
 	}
 
-	deleted, err := st.DeleteTenant(tenantAID)
+	summary, err := st.DeleteTenantWithSummary(tenantAID)
 	if err != nil {
-		t.Fatalf("DeleteTenant: %v", err)
+		t.Fatalf("DeleteTenantWithSummary: %v", err)
 	}
-	if !deleted {
-		t.Fatal("DeleteTenant reported nothing deleted for a tenant that exists")
+	if !summary.Deleted {
+		t.Fatal("DeleteTenantWithSummary reported nothing deleted for a tenant that exists")
+	}
+	if summary.Memories != 1 {
+		t.Errorf("DeleteTenantWithSummary Memories = %d, want 1", summary.Memories)
+	}
+	if summary.APIKeys != 1 {
+		t.Errorf("DeleteTenantWithSummary APIKeys = %d, want 1", summary.APIKeys)
 	}
 
 	var tenantCount, keyCount int
