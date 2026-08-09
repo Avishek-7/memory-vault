@@ -281,12 +281,23 @@ func redactSensitiveQueryParams(raw string) string {
 	return raw[:queryStart+1] + strings.Join(parts, "&") + raw[queryEnd:]
 }
 
+// promptLine reads one line. ReadString returns io.EOF alongside whatever
+// was read when the input ends without a trailing newline — a perfectly
+// valid final answer from a pipe like `printf 'yes'`, not a failure — so
+// EOF is only treated as fatal when nothing came back with it. A prior
+// answer here (bare "line, _ := ...") silently discarded EOF entirely and
+// could loop forever re-prompting into closed/empty stdin; this keeps that
+// case an error while no longer rejecting a real trailing answer.
 func promptLine(reader *bufio.Reader, prompt string) (string, error) {
 	if prompt != "" {
 		fmt.Print(prompt)
 	}
 	line, err := reader.ReadString('\n')
-	return strings.TrimSpace(line), err
+	trimmed := strings.TrimSpace(line)
+	if err != nil && trimmed != "" {
+		err = nil
+	}
+	return trimmed, err
 }
 
 func promptYesNo(reader *bufio.Reader, prompt string, defaultYes bool) (bool, error) {

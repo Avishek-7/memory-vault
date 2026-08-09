@@ -310,3 +310,35 @@ func TestDeleteTenantRefusesBootstrap(t *testing.T) {
 		t.Fatal("bootstrap tenant row is gone despite DeleteTenant returning an error")
 	}
 }
+
+// TestDeleteTenantRefusesBootstrapAlternateSpellings guards the same check
+// against Postgres's uuid type accepting more than one spelling of the
+// same value — braces, no hyphens, mixed case are all the *same* uuid to
+// Postgres, so a plain Go string compare against the canonical form could
+// have let one slip past the guard while DELETE still matched the real row.
+func TestDeleteTenantRefusesBootstrapAlternateSpellings(t *testing.T) {
+	st := setupTenantDB(t)
+	spellings := []string{
+		"{00000000-0000-0000-0000-000000000001}", // braced
+		"00000000000000000000000000000001",       // no hyphens
+		strings.ToUpper(BootstrapTenantID),       // mixed case
+	}
+	for _, spelling := range spellings {
+		t.Run(spelling, func(t *testing.T) {
+			deleted, err := st.DeleteTenant(spelling)
+			if err == nil {
+				t.Fatalf("DeleteTenant(%q) succeeded, want a refusal error", spelling)
+			}
+			if deleted {
+				t.Errorf("DeleteTenant(%q) reported deleted=true alongside an error", spelling)
+			}
+		})
+	}
+	var stillThere int
+	if err := st.db.pool.QueryRow(`SELECT count(*) FROM tenants WHERE id = $1`, BootstrapTenantID).Scan(&stillThere); err != nil {
+		t.Fatalf("counting bootstrap tenant: %v", err)
+	}
+	if stillThere != 1 {
+		t.Fatal("bootstrap tenant row is gone despite every DeleteTenant call returning an error")
+	}
+}

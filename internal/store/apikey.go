@@ -207,8 +207,18 @@ func (s *Store) RevokeAPIKey(id string) (bool, error) {
 // before multi-tenancy existed, on every self-hosted single-tenant deploy.
 // Deleting it is never the intended target of an operator command; it would
 // only ever be a typo.
+//
+// The comparison happens in Postgres, not Go: uuid accepts several
+// equivalent spellings of the same value (braces, no hyphens, mixed case —
+// see the uuid type docs), so a plain Go string compare against the
+// canonical form could let one of those slip past the guard while
+// DELETE's own WHERE clause still matched the real bootstrap row.
 func (s *Store) DeleteTenant(tenantID string) (bool, error) {
-	if tenantID == BootstrapTenantID {
+	var isBootstrap bool
+	if err := s.db.pool.QueryRow(`SELECT $1::uuid = $2::uuid`, tenantID, BootstrapTenantID).Scan(&isBootstrap); err != nil {
+		return false, fmt.Errorf("validating tenant id: %w", err)
+	}
+	if isBootstrap {
 		return false, fmt.Errorf("refusing to delete the bootstrap tenant (%s) — it owns every pre-multi-tenancy row", BootstrapTenantID)
 	}
 	res, err := s.db.pool.Exec(`DELETE FROM tenants WHERE id = $1`, tenantID)

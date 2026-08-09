@@ -427,6 +427,7 @@ Environment variables:
 | `MAX_REQUEST_BODY_MB` | `25` | Max `/mcp` request body size, in MB — guards against unbounded-memory requests (e.g. an oversized `import_memories` payload) |
 | `AUTH_TOKEN` | *(none)* | Shared bearer token(s) authenticating as the bootstrap tenant (comma-separated for multiple clients). If unset, `/mcp` is open only while no API key exists — see [Tenants and API keys](#tenants-and-api-keys) |
 | `ALLOWED_HOSTS` | *(none)* | Comma-separated `Host` header allowlist, guards against DNS-rebinding. If unset, the check is skipped — set this in production. |
+| `TRUSTED_PROXY_IPS` | *(none)* | Comma-separated bare IPs (no port) allowed to set `X-Forwarded-For` for logging — normally just your reverse proxy's address on the docker network. If unset, `X-Forwarded-For` is never trusted and logs show the connecting peer's real address instead. **Only relevant if this port is also reachable directly** (e.g. published to the LAN alongside being proxied) — otherwise every caller's `RemoteAddr` already *is* the proxy, and trusting the header there would let a caller who bypasses the proxy forge what gets logged. |
 | `PLAN_<PLAN>_RPM` | per plan | Sustained requests/minute for `FREE`/`BUILDER`/`TEAM`; `0` disables the limit — see [Plans, rate limits, and quotas](#plans-rate-limits-and-quotas) |
 | `PLAN_<PLAN>_BURST` | per plan | How many requests an idle tenant may make at once (capped at that plan's `RPM`) |
 | `PLAN_<PLAN>_MAX_MEMORIES` | per plan | Maximum memories a tenant on that plan may store; `0` disables the limit |

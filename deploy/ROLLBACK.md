@@ -63,27 +63,42 @@ there isn't one.
 # 1. Stop the app so nothing writes against the bad schema while you work.
 docker compose stop memory-vault
 
-# 2. Restore the last good pg_dump (see README's "Backups cover every
-#    tenant" for what BACKUP_DATABASE_URL needs to be, and this file's
-#    "Restore procedure" below for the actual commands). --clean --if-exists
-#    means this replaces the current schema, it does not merge with it.
-psql "$SUPERUSER_DATABASE_URL" -v ON_ERROR_STOP=1 -f dump.sql
+# 2. Fetch and decrypt the last good backup — same repo/branch backup.sh
+#    pushes to, same steps standby-sync.sh already automates. AGE_IDENTITY
+#    is the private half of backup.sh's AGE_RECIPIENT.
+git clone --quiet "$BACKUP_GIT_REMOTE" /tmp/mv-restore
+age -d -i "$AGE_IDENTITY" -o /tmp/mv-restore/dump.sql \
+    /tmp/mv-restore/memory-vault-dump.sql.age
 
-# 3. Roll the image back too if the bad migration shipped inside a bad
+# 3. Restore it. --clean --if-exists means this replaces the current
+#    schema, it does not merge with it. See README's "Backups cover every
+#    tenant" for what SUPERUSER_DATABASE_URL needs to be.
+psql "$SUPERUSER_DATABASE_URL" -v ON_ERROR_STOP=1 -f /tmp/mv-restore/dump.sql
+
+# 4. Roll the image back too if the bad migration shipped inside a bad
 #    commit (part 1) — otherwise the same image just re-runs the same
 #    migration against the just-restored schema on its next start.
 
-# 4. Bring the app back up and verify (see part 1's checks) before
+# 5. Bring the app back up and verify (see part 1's checks) before
 #    declaring the incident over.
 docker compose up -d memory-vault
+rm -rf /tmp/mv-restore
 ```
 
 Any write made between the bad migration landing and the restore is lost —
 `--clean --if-exists` is a point-in-time restore, not a merge. That gap is
-bounded by how often backups actually run, which is why part 3 below
-matters as much as this section does.
+bounded by how often backups actually run.
 
-## 3. Restore procedure (verified 2026-08-09)
+**This exact procedure — the `pg_dump`+`age` path above — has not itself
+been run end-to-end**, because as section 3 below explains, `backup.sh`
+isn't deployed yet, so there is no encrypted dump to fetch. What *has* been
+verified is a different backup lineage (the raw-tar cron job) restoring
+cleanly; that's meaningful evidence the underlying data isn't corrupt, but
+it is not a test of the commands directly above. Treat this section's
+commands as reviewed-correct against `backup.sh`/`standby-sync.sh`'s own
+logic, not as drilled.
+
+## 3. Raw-tar backup check (verified 2026-08-09, not the pg_dump path above)
 
 This was tested end-to-end on the live host, non-destructively — extracted
 a production backup into a throwaway container and diffed it against the

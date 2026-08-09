@@ -142,6 +142,20 @@ func TestPromptYesNoEOF(t *testing.T) {
 	}
 }
 
+// TestPromptYesNoAcceptsFinalLineWithoutNewline guards against a real
+// regression: ReadString returns a non-empty final line bundled with
+// io.EOF when the input has no trailing newline (e.g. `printf 'yes'`
+// piped in, as opposed to `echo`). That's a valid answer, not a failure.
+func TestPromptYesNoAcceptsFinalLineWithoutNewline(t *testing.T) {
+	got, err := promptYesNo(bufio.NewReader(strings.NewReader("yes")), "confirm? ", false)
+	if err != nil {
+		t.Fatalf("promptYesNo error = %v, want nil for a valid final answer", err)
+	}
+	if !got {
+		t.Errorf("promptYesNo(%q) = false, want true", "yes")
+	}
+}
+
 func TestPromptWizardEOF(t *testing.T) {
 	_, _, err := promptWizard(bufio.NewReader(strings.NewReader("")), "home")
 	if !errors.Is(err, io.EOF) {

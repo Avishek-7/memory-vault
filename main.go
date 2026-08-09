@@ -16,6 +16,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -1011,17 +1012,45 @@ func checkHost(r *http.Request) bool {
 	return false
 }
 
-// clientIP prefers the first X-Forwarded-For hop over r.RemoteAddr, which
-// behind Traefik is always Traefik's own address — logging RemoteAddr alone
-// would make every denial line show the same reverse-proxy IP no matter who
-// actually sent the request. Trusting the header here is scoped to this
-// deployment, where Traefik is the only thing that can reach this process
-// (see ALLOWED_HOSTS/checkHost above); it would need re-examining if this
-// were ever exposed directly to the internet without a proxy in front.
+// trustedProxyIPs returns the TRUSTED_PROXY_IPS allowlist (comma-separated
+// bare IPs, no port — Traefik's address on the compose network). Empty
+// means X-Forwarded-For is never trusted, same fail-closed default as
+// allowedHosts/ALLOWED_HOSTS above.
+func trustedProxyIPs() []string {
+	raw := os.Getenv("TRUSTED_PROXY_IPS")
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, ",")
+}
+
+// clientIP prefers the first X-Forwarded-For hop over r.RemoteAddr, but
+// only when RemoteAddr itself is a configured trusted proxy. Without that
+// check this would be a log-forging vector, not a fix for one: ALLOWED_HOSTS
+// on this deployment lists both the Traefik-fronted hostname and a direct
+// "host:8080" address, because docker-compose.yml publishes this port
+// straight to the LAN interface (`ports: - "8080:8080"`) alongside routing
+// it through Traefik. Anyone who can reach the published port directly
+// bypasses Traefik entirely and can set X-Forwarded-For to whatever they
+// like — Docker's port publishing preserves the real source IP as
+// RemoteAddr, it does not inject a proxy hop, so an unguarded trust of the
+// header would let that caller's forged value overwrite it in every log
+// line. A request actually proxied through Traefik has RemoteAddr equal to
+// Traefik's own container address, which is what TRUSTED_PROXY_IPS names.
 func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		first, _, _ := strings.Cut(fwd, ",")
-		return strings.TrimSpace(first)
+	fwd := r.Header.Get("X-Forwarded-For")
+	if fwd == "" {
+		return r.RemoteAddr
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	for _, trusted := range trustedProxyIPs() {
+		if host == trusted {
+			first, _, _ := strings.Cut(fwd, ",")
+			return strings.TrimSpace(first)
+		}
 	}
 	return r.RemoteAddr
 }
