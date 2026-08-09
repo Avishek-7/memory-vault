@@ -234,6 +234,9 @@ func (s *Store) DeleteTenantWithSummary(tenantID string) (TenantDeleteSummary, e
 		return TenantDeleteSummary{}, err
 	}
 	defer tx.Rollback()
+	if _, err := tx.Exec(`SELECT set_config('app.tenant_id', $1, true)`, tenantID); err != nil {
+		return TenantDeleteSummary{}, fmt.Errorf("binding app.tenant_id: %w", err)
+	}
 
 	if err := tx.QueryRow(`SELECT id::text FROM tenants WHERE id = $1 FOR UPDATE`, tenantID).Scan(new(string)); err == sql.ErrNoRows {
 		return TenantDeleteSummary{Deleted: false}, nil
