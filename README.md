@@ -530,6 +530,10 @@ cd /home/avishek/Docker && docker compose up -d memory-vault
 (`develop` is where in-progress work lands; merge to `master` once stable
 to trigger the pipeline.)
 
+If a deploy or a migration goes wrong, see `deploy/ROLLBACK.md` — the two
+failure modes need different fixes, and a migration that fully applies but
+turns out wrong has no `down` path, only a restore from backup.
+
 ## Chunking
 
 `all-minilm` has a 256-token context window. `save_memory` automatically
@@ -544,6 +548,14 @@ plain prose) — so if the embedder still rejects a chunk as too long,
 than trusting the estimate to always hold.
 
 ## Fallback / failover
+
+**This describes what the tooling in `deploy/` is built to do, not a claim
+that it's running anywhere right now.** The scripts and the systemd
+`.service`/`.timer` unit files exist, but installing them (`systemctl
+enable --now`) and standing up an actual standby host are separate,
+deliberate steps — check `systemctl status memory-vault-backup.timer` (and
+the standby-sync/failover-watch equivalents on whatever host is meant to be
+the standby) before assuming any of this is live.
 
 If the host running memory-vault goes down, clients (Claude Desktop,
 Claude Code, Copilot, n8n, or anything else pointed at the same MCP URL)
