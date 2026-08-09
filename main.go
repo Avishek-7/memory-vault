@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -1010,6 +1011,21 @@ func checkHost(r *http.Request) bool {
 	return false
 }
 
+// clientIP prefers the first X-Forwarded-For hop over r.RemoteAddr, which
+// behind Traefik is always Traefik's own address — logging RemoteAddr alone
+// would make every denial line show the same reverse-proxy IP no matter who
+// actually sent the request. Trusting the header here is scoped to this
+// deployment, where Traefik is the only thing that can reach this process
+// (see ALLOWED_HOSTS/checkHost above); it would need re-examining if this
+// were ever exposed directly to the internet without a proxy in front.
+func clientIP(r *http.Request) string {
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		first, _, _ := strings.Cut(fwd, ",")
+		return strings.TrimSpace(first)
+	}
+	return r.RemoteAddr
+}
+
 // healthzHandler answers "can this instance serve MCP requests" — a cheap
 // Postgres ping, nothing more. It deliberately doesn't check Ollama:
 // embedding/chat calls failing because Ollama is down is a lesser,
@@ -1022,6 +1038,7 @@ func checkHost(r *http.Request) bool {
 // health on possession of a secret.
 func healthzHandler(w http.ResponseWriter, r *http.Request) {
 	if !checkHost(r) {
+		log.Printf("healthz: rejected Host %q from %s", r.Host, clientIP(r))
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -1037,11 +1054,16 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 
 func mcpHandler(w http.ResponseWriter, r *http.Request) {
 	if !checkHost(r) {
+		log.Printf("mcp: rejected Host %q from %s", r.Host, clientIP(r))
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	vault, ok := authenticate(r)
 	if !ok {
+		// Never log the credential itself: a mistyped guess is often a real
+		// but revoked/expired key, and this line ends up in Dozzle's shared
+		// log view — a wider audience than the database holding the hash.
+		log.Printf("mcp: auth rejected from %s", clientIP(r))
 		w.Header().Set("WWW-Authenticate", `Bearer realm="memory-vault"`)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -1055,6 +1077,7 @@ func mcpHandler(w http.ResponseWriter, r *http.Request) {
 		tenant := vault.TenantID()
 		if !tenantLimiter.Allow(tenant, limits.RequestsPerMinute, limits.Burst) {
 			retry := tenantLimiter.RetryAfter(tenant, limits.RequestsPerMinute)
+			log.Printf("mcp: rate limit exceeded for tenant %s from %s", tenant, clientIP(r))
 			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(retry)))
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
@@ -1174,7 +1197,7 @@ func runImportCLI(args []string) {
 // surface to authenticate, so there is none to get wrong.
 func runTenantCLI(args []string) {
 	if len(args) == 0 {
-		log.Fatal("usage: memory-vault tenant create|list")
+		log.Fatal("usage: memory-vault tenant create|list|delete")
 	}
 	switch args[0] {
 	case "create":
@@ -1207,8 +1230,44 @@ func runTenantCLI(args []string) {
 			fmt.Printf("%s\t%s\t%s\t%s\n", t.ID, t.Email, t.Plan, t.CreatedAt.Format(time.RFC3339))
 		}
 
+	case "delete":
+		fs := flag.NewFlagSet("tenant delete", flag.ExitOnError)
+		id := fs.String("id", "", "tenant id to delete (see `tenant list`)")
+		force := fs.Bool("force", false, "skip the interactive confirmation prompt (for scripted use)")
+		fs.Parse(args[1:])
+		if *id == "" {
+			log.Fatal("tenant delete: -id is required")
+		}
+		// Both counts are taken before the delete: the tenant row and
+		// everything cascading from it are gone the moment DeleteTenant
+		// returns, so this is the only chance to report what was removed.
+		usage, err := st.ForTenant(*id).Usage()
+		if err != nil {
+			log.Fatalf("tenant delete: checking usage: %v", err)
+		}
+		keys, err := st.APIKeys(*id)
+		if err != nil {
+			log.Fatalf("tenant delete: checking keys: %v", err)
+		}
+		if !*force {
+			fmt.Printf("This will permanently delete tenant %s and all %d of its memories and %d API keys — this cannot be undone.\nType the tenant id to confirm: ", *id, usage.Memories, len(keys))
+			reader := bufio.NewReader(os.Stdin)
+			line, _ := reader.ReadString('\n')
+			if strings.TrimSpace(line) != *id {
+				log.Fatal("tenant delete: confirmation did not match, aborted")
+			}
+		}
+		deleted, err := st.DeleteTenant(*id)
+		if err != nil {
+			log.Fatalf("tenant delete: %v", err)
+		}
+		if !deleted {
+			log.Fatalf("tenant delete: no tenant with id %s", *id)
+		}
+		fmt.Printf("deleted tenant %s (%d memories, %d API keys removed via cascade)\n", *id, usage.Memories, len(keys))
+
 	default:
-		log.Fatalf("unknown tenant subcommand %q (want create or list)", args[0])
+		log.Fatalf("unknown tenant subcommand %q (want create, list, or delete)", args[0])
 	}
 }
 

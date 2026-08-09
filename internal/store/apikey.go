@@ -196,3 +196,25 @@ func (s *Store) RevokeAPIKey(id string) (bool, error) {
 	affected, err := res.RowsAffected()
 	return affected > 0, err
 }
+
+// DeleteTenant permanently removes a tenant and, via ON DELETE CASCADE on
+// their foreign keys, every one of its memories and API keys. There is no
+// soft-delete: this is what "cancellation flow" and GDPR right-to-delete
+// both need to actually be true, not just deferred to app-level filtering
+// that a bug could bypass.
+//
+// Refuses BootstrapTenantID outright — that id owns every row written
+// before multi-tenancy existed, on every self-hosted single-tenant deploy.
+// Deleting it is never the intended target of an operator command; it would
+// only ever be a typo.
+func (s *Store) DeleteTenant(tenantID string) (bool, error) {
+	if tenantID == BootstrapTenantID {
+		return false, fmt.Errorf("refusing to delete the bootstrap tenant (%s) — it owns every pre-multi-tenancy row", BootstrapTenantID)
+	}
+	res, err := s.db.pool.Exec(`DELETE FROM tenants WHERE id = $1`, tenantID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	return affected > 0, err
+}

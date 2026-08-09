@@ -224,3 +224,89 @@ func TestKeyScopedStoresStayIsolated(t *testing.T) {
 		t.Errorf("tenant B read %q, want its own content", got)
 	}
 }
+
+// TestDeleteTenantCascades is the load-bearing test for the cancellation/
+// right-to-delete path: it must fail if the tenants/memories/api_keys
+// foreign keys ever lose ON DELETE CASCADE, which would silently turn
+// "delete this tenant" into "orphan this tenant's data instead."
+func TestDeleteTenantCascades(t *testing.T) {
+	st := setupTenantDB(t)
+	clearAPIKeys(t, st)
+	makeTenant(t, st, tenantAID, "delete-me@example.test")
+
+	if _, err := st.CreateAPIKey(tenantAID, "laptop"); err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+	scoped := st.ForTenant(tenantAID)
+	if _, err := scoped.SaveMemory("default", "note", "content to be deleted", DefaultSource, DefaultKind); err != nil {
+		t.Fatalf("SaveMemory: %v", err)
+	}
+
+	deleted, err := st.DeleteTenant(tenantAID)
+	if err != nil {
+		t.Fatalf("DeleteTenant: %v", err)
+	}
+	if !deleted {
+		t.Fatal("DeleteTenant reported nothing deleted for a tenant that exists")
+	}
+
+	var tenantCount, keyCount int
+	if err := st.db.pool.QueryRow(`SELECT count(*) FROM tenants WHERE id = $1`, tenantAID).Scan(&tenantCount); err != nil {
+		t.Fatalf("counting tenants: %v", err)
+	}
+	if err := st.db.pool.QueryRow(`SELECT count(*) FROM api_keys WHERE tenant_id = $1`, tenantAID).Scan(&keyCount); err != nil {
+		t.Fatalf("counting api_keys: %v", err)
+	}
+	// Goes through the tenant-scoped Usage(), not a raw pool query, since
+	// memories carries FORCE ROW LEVEL SECURITY: a raw query on a pooled
+	// connection that previously had SET LOCAL app.tenant_id bound on it
+	// (from scoped.SaveMemory above) sees current_setting return '' rather
+	// than error once outside that transaction, and ''::uuid fails — the
+	// same tenant-scoped path every real caller already uses avoids this.
+	usageAfter, err := scoped.Usage()
+	if err != nil {
+		t.Fatalf("counting memories: %v", err)
+	}
+	memoryCount := usageAfter.Memories
+	if tenantCount != 0 {
+		t.Errorf("tenant row survived DeleteTenant")
+	}
+	if keyCount != 0 {
+		t.Errorf("%d API key row(s) survived DeleteTenant — cascade did not fire", keyCount)
+	}
+	if memoryCount != 0 {
+		t.Errorf("%d memory row(s) survived DeleteTenant — cascade did not fire, this is a right-to-delete failure", memoryCount)
+	}
+
+	// Deleting again must report "nothing to delete", not silently succeed a
+	// second time — an operator retrying a command shouldn't be told it
+	// worked when there was nothing left to remove.
+	deletedAgain, err := st.DeleteTenant(tenantAID)
+	if err != nil {
+		t.Fatalf("DeleteTenant (second call): %v", err)
+	}
+	if deletedAgain {
+		t.Error("DeleteTenant reported success deleting an already-deleted tenant")
+	}
+}
+
+// TestDeleteTenantRefusesBootstrap guards the one-line safety check that
+// stops an operator typo from destroying every pre-multi-tenancy row on a
+// self-hosted single-tenant deploy.
+func TestDeleteTenantRefusesBootstrap(t *testing.T) {
+	st := setupTenantDB(t)
+	deleted, err := st.DeleteTenant(BootstrapTenantID)
+	if err == nil {
+		t.Fatal("DeleteTenant(BootstrapTenantID) succeeded, want a refusal error")
+	}
+	if deleted {
+		t.Error("DeleteTenant(BootstrapTenantID) reported deleted=true alongside an error")
+	}
+	var stillThere int
+	if err := st.db.pool.QueryRow(`SELECT count(*) FROM tenants WHERE id = $1`, BootstrapTenantID).Scan(&stillThere); err != nil {
+		t.Fatalf("counting bootstrap tenant: %v", err)
+	}
+	if stillThere != 1 {
+		t.Fatal("bootstrap tenant row is gone despite DeleteTenant returning an error")
+	}
+}

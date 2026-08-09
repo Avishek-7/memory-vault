@@ -434,3 +434,29 @@ func TestCompactionRefusesToGrowStorage(t *testing.T) {
 		t.Errorf("the oversized merge was written anyway (%d bytes)", len(got))
 	}
 }
+
+func TestClientIPPrefersForwardedFor(t *testing.T) {
+	cases := []struct {
+		name       string
+		remoteAddr string
+		forwardFor string
+		want       string
+	}{
+		{"no proxy header, falls back to RemoteAddr", "203.0.113.9:54321", "", "203.0.113.9:54321"},
+		{"single hop", "10.0.0.1:1234", "198.51.100.7", "198.51.100.7"},
+		{"multiple hops, takes the first (original client)", "10.0.0.1:1234", "198.51.100.7, 10.0.0.2, 10.0.0.1", "198.51.100.7"},
+		{"whitespace around the first hop is trimmed", "10.0.0.1:1234", " 198.51.100.7 , 10.0.0.2", "198.51.100.7"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+			r.RemoteAddr = c.remoteAddr
+			if c.forwardFor != "" {
+				r.Header.Set("X-Forwarded-For", c.forwardFor)
+			}
+			if got := clientIP(r); got != c.want {
+				t.Errorf("clientIP() = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
