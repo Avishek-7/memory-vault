@@ -436,6 +436,53 @@ func TestCompactionRefusesToGrowStorage(t *testing.T) {
 	}
 }
 
+// TestCompactGroupsForSpaceReportsConflictsInsteadOfMerging covers why
+// compactGroupsForSpace calls out to TypeSafe at all: cosine distance on
+// centroid embeddings can't distinguish a paraphrase from a contradiction,
+// so two memories that embed identically close (fixedEmbedder makes every
+// pair a cosine candidate) must still be kept apart, not merged, when
+// TypeSafe judges them as conflicting.
+func TestCompactGroupsForSpaceReportsConflictsInsteadOfMerging(t *testing.T) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("DATABASE_URL not set")
+	}
+	vault, err := store.Open(store.Config{DatabaseURL: url, Embedder: fixedEmbedder{}})
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer vault.Close()
+
+	const space = "compact-conflict"
+	names := []string{"a", "b"}
+	for _, n := range names {
+		if _, err := vault.SaveMemory(space, n, n+" content", store.DefaultSource, store.DefaultKind); err != nil {
+			t.Fatalf("SaveMemory: %v", err)
+		}
+		defer vault.DeleteMemory(space, n)
+	}
+
+	t.Setenv("TYPESAFE_API_KEY", "test-key")
+	original := typesafeJudgeMerge
+	defer func() { typesafeJudgeMerge = original }()
+	typesafeJudgeMerge = func(string, string) (float64, float64, error) {
+		return 0.1, 0.9, nil // low merge probability, high conflict probability
+	}
+
+	groups, conflicts, err := compactGroupsForSpace(vault, space)
+	if err != nil {
+		t.Fatalf("compactGroupsForSpace: %v", err)
+	}
+	if len(conflicts) != 1 {
+		t.Fatalf("conflicts = %v, want exactly 1 entry", conflicts)
+	}
+	for _, g := range groups {
+		if len(g) > 1 {
+			t.Errorf("group %v: a conflicting pair must not be merged into one group", g)
+		}
+	}
+}
+
 func TestClientIPPrefersForwardedFor(t *testing.T) {
 	t.Setenv("TRUSTED_PROXY_IPS", "10.0.0.1")
 	cases := []struct {

@@ -27,6 +27,7 @@ import (
 	"memory-vault/internal/embed"
 	"memory-vault/internal/ratelimit"
 	"memory-vault/internal/store"
+	"memory-vault/internal/typesafe"
 )
 
 var st *store.Store
@@ -163,6 +164,14 @@ var ollamaChat = func(prompt string) (string, error) {
 	return chat.Chat(ollamaURL(), ollamaChatModel(), prompt)
 }
 
+// typesafeJudgeMerge is a var, not a func, purely so tests can substitute a
+// judgment without a live TypeSafe API key. An empty TYPESAFE_API_KEY means
+// this feature is off: compactGroupsForSpace falls back to cosine distance
+// alone, exactly its pre-TypeSafe behavior.
+var typesafeJudgeMerge = func(a, b string) (mergeProb, conflictProb float64, err error) {
+	return typesafe.JudgeMerge(os.Getenv("TYPESAFE_API_KEY"), a, b)
+}
+
 // sessionSummaryPrompt builds a resume prompt from a space's recent
 // memories (via the shared internal/chat template, so the TUI's "s"
 // keybinding can't drift out of sync) and sends it through ollamaChat.
@@ -248,7 +257,7 @@ var tools = []tool{
 	},
 	{
 		Name:        "compact_memories",
-		Description: "Find near-duplicate or stale memories (within a space, or all spaces if omitted) and merge/summarize them via the local Ollama chat model. Memories of kind \"decision\" are never selected for compaction. dry_run (default true) returns the proposed plan without writing anything.",
+		Description: "Find near-duplicate or stale memories (within a space, or all spaces if omitted) and merge/summarize them via the local Ollama chat model. Memories of kind \"decision\" are never selected for compaction. If TYPESAFE_API_KEY is configured, cosine-close pairs are confirmed via TypeSafe before merging; pairs that actually conflict (one supersedes/contradicts the other) are reported separately instead of being merged. dry_run (default true) returns the proposed plan without writing anything.",
 		InputSchema: schema(nil, map[string]string{"space": "string", "dry_run": "boolean"}),
 	},
 	{
@@ -329,14 +338,51 @@ func compactTargetName(names []string) string {
 	return names[0] + "-merged"
 }
 
+// confirmMerge decides whether two cosine-close memories actually belong in
+// the same compaction group. Cosine distance on centroid embeddings can't
+// tell a paraphrased restatement from an outright contradiction — "JWT
+// tokens" vs "reverted to session cookies" embed just as close as a true
+// duplicate — so when TYPESAFE_API_KEY is set, this asks TypeSafe's Jev
+// model directly against the two memories' actual content. A conflict is
+// never merged (conflictLine is non-empty in that case); on any error, or
+// when TypeSafe isn't configured, it falls back to trusting the cosine
+// distance alone (this function's pre-TypeSafe behavior).
+func confirmMerge(vault *store.Store, space string, a, b store.MemoryCentroid) (merge bool, conflictLine string) {
+	if os.Getenv("TYPESAFE_API_KEY") == "" {
+		return true, ""
+	}
+	contentA, err := vault.Reassemble(space, a.Name)
+	if err != nil {
+		log.Printf("compact_memories: reassembling %q for TypeSafe confirmation: %v", a.Name, err)
+		return false, ""
+	}
+	contentB, err := vault.Reassemble(space, b.Name)
+	if err != nil {
+		log.Printf("compact_memories: reassembling %q for TypeSafe confirmation: %v", b.Name, err)
+		return false, ""
+	}
+	mergeProb, conflictProb, err := typesafeJudgeMerge(contentA, contentB)
+	if err != nil {
+		log.Printf("compact_memories: TypeSafe judgment for %q/%q failed, not merging: %v", a.Name, b.Name, err)
+		return false, ""
+	}
+	if conflictProb >= 0.5 {
+		return false, fmt.Sprintf("space %q: %q and %q look related but disagree — not merged, resolve manually", space, a.Name, b.Name)
+	}
+	return mergeProb >= 0.5, ""
+}
+
 // compactGroupsForSpace groups a space's memories into compaction
 // candidates: connected components under the similarity threshold (any
-// chain of near-duplicate centroids), plus lone memories past the
-// staleness window (candidates for solo re-summarization).
-func compactGroupsForSpace(vault *store.Store, space string) ([][]store.MemoryCentroid, error) {
+// chain of near-duplicate centroids, confirmed pairwise via TypeSafe when
+// configured — see confirmMerge), plus lone memories past the staleness
+// window (candidates for solo re-summarization). Pairs TypeSafe flags as
+// conflicting rather than duplicate are reported separately instead of
+// being merged.
+func compactGroupsForSpace(vault *store.Store, space string) (groups [][]store.MemoryCentroid, conflicts []string, err error) {
 	all, err := vault.MemoryCentroids(space)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// Decisions are never compaction candidates — they record something
 	// that was explicitly decided, and merging or age-based pruning could
@@ -371,7 +417,14 @@ func compactGroupsForSpace(vault *store.Store, space string) ([][]store.MemoryCe
 	}
 	for i := 0; i < len(infos); i++ {
 		for j := i + 1; j < len(infos); j++ {
-			if store.CosineDistance(infos[i].Centroid, infos[j].Centroid) < threshold {
+			if store.CosineDistance(infos[i].Centroid, infos[j].Centroid) >= threshold {
+				continue
+			}
+			merge, conflictLine := confirmMerge(vault, space, infos[i], infos[j])
+			if conflictLine != "" {
+				conflicts = append(conflicts, conflictLine)
+			}
+			if merge {
 				union(i, j)
 			}
 		}
@@ -382,7 +435,6 @@ func compactGroupsForSpace(vault *store.Store, space string) ([][]store.MemoryCe
 		r := find(i)
 		byRoot[r] = append(byRoot[r], i)
 	}
-	var groups [][]store.MemoryCentroid
 	for _, idxs := range byRoot {
 		if len(idxs) == 1 {
 			m := infos[idxs[0]]
@@ -402,7 +454,7 @@ func compactGroupsForSpace(vault *store.Store, space string) ([][]store.MemoryCe
 		}
 		groups = append(groups, g)
 	}
-	return groups, nil
+	return groups, conflicts, nil
 }
 
 // compactGroup either describes (dry_run) or performs the merge of one
@@ -654,11 +706,13 @@ func callTool(vault *store.Store, name string, args map[string]interface{}) map[
 		}
 
 		var lines []string
+		var conflictLines []string
 		for _, sp := range spaces {
-			groups, err := compactGroupsForSpace(vault, sp)
+			groups, conflicts, err := compactGroupsForSpace(vault, sp)
 			if err != nil {
 				return internalErr("compact_memories groups", err)
 			}
+			conflictLines = append(conflictLines, conflicts...)
 			for _, g := range groups {
 				line, err := compactGroup(vault, sp, g, dryRun)
 				if quotaErr := quotaResult(err); quotaErr != nil {
@@ -670,17 +724,24 @@ func callTool(vault *store.Store, name string, args map[string]interface{}) map[
 				lines = append(lines, line)
 			}
 		}
-		if len(lines) == 0 {
+		if len(lines) == 0 && len(conflictLines) == 0 {
 			if dryRun {
 				return textResult("(no compaction candidates found)")
 			}
 			return textResult("(nothing to compact)")
 		}
-		verb := "would compact"
-		if !dryRun {
-			verb = "compacted"
+		var out []string
+		if len(lines) > 0 {
+			verb := "would compact"
+			if !dryRun {
+				verb = "compacted"
+			}
+			out = append(out, fmt.Sprintf("%s %d group(s):\n%s", verb, len(lines), strings.Join(lines, "\n")))
 		}
-		return textResult(fmt.Sprintf("%s %d group(s):\n%s", verb, len(lines), strings.Join(lines, "\n")))
+		if len(conflictLines) > 0 {
+			out = append(out, fmt.Sprintf("%d conflict(s), not merged:\n%s", len(conflictLines), strings.Join(conflictLines, "\n")))
+		}
+		return textResult(strings.Join(out, "\n\n"))
 
 	case "get_session_summary":
 		space := argSpace(args)
