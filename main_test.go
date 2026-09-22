@@ -436,18 +436,33 @@ func TestCompactionRefusesToGrowStorage(t *testing.T) {
 	}
 }
 
+// identicalVectorEmbedder returns the same non-zero vector for every input,
+// so any two memories it embeds are exact cosine-distance-0 candidates.
+// Unlike fixedEmbedder's all-zero vector, this doesn't trip
+// CosineDistance's na==0/nb==0 fallback (which returns 1, "maximally
+// distant" for an undefined cosine similarity) — that fallback is exactly
+// what would otherwise keep a candidate pair from ever reaching TypeSafe
+// confirmation in this test.
+type identicalVectorEmbedder struct{}
+
+func (identicalVectorEmbedder) Embed(string) ([]float32, error) {
+	v := make([]float32, store.DefaultEmbedDim)
+	v[0] = 1
+	return v, nil
+}
+
 // TestCompactGroupsForSpaceReportsConflictsInsteadOfMerging covers why
 // compactGroupsForSpace calls out to TypeSafe at all: cosine distance on
 // centroid embeddings can't distinguish a paraphrase from a contradiction,
-// so two memories that embed identically close (fixedEmbedder makes every
-// pair a cosine candidate) must still be kept apart, not merged, when
-// TypeSafe judges them as conflicting.
+// so two memories that embed identically close (identicalVectorEmbedder
+// makes every pair a cosine candidate) must still be kept apart, not
+// merged, when TypeSafe judges them as conflicting.
 func TestCompactGroupsForSpaceReportsConflictsInsteadOfMerging(t *testing.T) {
 	url := os.Getenv("DATABASE_URL")
 	if url == "" {
 		t.Skip("DATABASE_URL not set")
 	}
-	vault, err := store.Open(store.Config{DatabaseURL: url, Embedder: fixedEmbedder{}})
+	vault, err := store.Open(store.Config{DatabaseURL: url, Embedder: identicalVectorEmbedder{}})
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
